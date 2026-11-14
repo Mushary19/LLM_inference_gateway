@@ -1,0 +1,16 @@
+services:
+  db:
+    image: postgres:17
+    container_name: inferenceflow-db
+    environment:
+      POSTGRES_DB: inferenceflow
+      POSTGRES_USER: inferenceflow
+      POSTGRES_PASSWORD: inferenceflow
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
