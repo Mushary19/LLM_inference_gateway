@@ -4,9 +4,11 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 
+from app.api.chat import router as chat_router
 from app.api.routes import router
 from app.core.config import settings
 from app.database.connection import SessionLocal
+from app.providers.factory import create_provider
 from app.services.inference import InferenceEngine, SimulatedInferenceEngine
 from app.services.resources import GpuMemoryManager, KvCacheSizer
 from app.services.scheduler import Scheduler
@@ -30,7 +32,10 @@ async def create_inference_engine() -> InferenceEngine:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # One engine per process: the API uses it to count input tokens, the scheduler to generate.
+    # Gateway path (/v1/chat/completions): calls the provider directly.
+    app.state.chat_provider = create_provider(settings.chat_provider)
+
+    # Legacy path (/generate): one engine per process, used for token counting and by the scheduler.
     inference_engine = await create_inference_engine()
     app.state.inference_engine = inference_engine
     scheduler = None
@@ -62,3 +67,4 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="InferenceFlow", lifespan=lifespan)
 app.include_router(router)
+app.include_router(chat_router)

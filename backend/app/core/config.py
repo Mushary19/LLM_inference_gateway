@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # Simultaneous model.generate() calls in the Hugging Face engine.
     inference_max_concurrency: int = Field(default=1, gt=0)
 
+    # Provider behind the gateway endpoint POST /v1/chat/completions.
+    chat_provider: Literal["fake"] = "fake"
+
     @model_validator(mode="after")
     def _check_gpu_memory(self) -> "Settings":
         if self.gpu_total_memory_mb <= self.gpu_model_memory_mb + self.gpu_runtime_memory_mb:
