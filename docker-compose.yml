@@ -12,5 +12,26 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
+  # Dedicated database for automated tests (pytest). Never point the app at it.
+  test-db:
+    image: postgres:17
+    container_name: inferenceflow-test-db
+    environment:
+      POSTGRES_DB: inferenceflow_test
+      POSTGRES_USER: inferenceflow_test
+      POSTGRES_PASSWORD: test-only-password # local test database only
+    ports:
+      - "15432:5432"
+    volumes:
+      - test_postgres_data:/var/lib/postgresql/data
+      # Sets the identity marker pytest checks for; runs only on a fresh volume.
+      - ./docker/test-db/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inferenceflow_test -d inferenceflow_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
 volumes:
   postgres_data:
+  test_postgres_data:

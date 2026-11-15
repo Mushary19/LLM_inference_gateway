@@ -182,15 +182,10 @@ isn't streamed yet.
 
 ### Run the tests without downloading the model
 
-```bash
-cd backend
-pip install -r requirements-dev.txt
-python -m pytest
-```
-
 The test suite always uses the simulated engine, even if `.env` sets
 `INFERENCE_ENGINE=huggingface`. The Hugging Face engine is tested with fake tokenizer and model
-objects, so no model is downloaded or loaded. PostgreSQL must be running.
+objects, so no model is downloaded or loaded. Tests need the separate test database described
+in [Testing](#testing).
 
 ### The resource manager is still a simulation
 
@@ -198,3 +193,94 @@ The scheduler's "GPU memory" and KV-cache blocks (see above) are **accounting on
 measure or limit the real CPU RAM used by PyTorch, and the KV-block sizing doesn't come from
 Qwen's architecture. A request can be refused for lack of simulated KV blocks while plenty of
 RAM is free, or the process can use more RAM than the simulation suggests.
+
+## Testing
+
+Automated tests run against their own PostgreSQL container, `test-db`, and never touch the
+development database.
+
+| | Development (`db`) | Tests (`test-db`) |
+|---|---|---|
+| Host port | 5432 | 15432 |
+| Database | `inferenceflow` | `inferenceflow_test` |
+| Volume | `inference_flow_postgres_data` | `inference_flow_test_postgres_data` |
+| Configured by | `DATABASE_URL` | `TEST_DATABASE_URL` |
+
+### Required configuration
+
+Set `TEST_DATABASE_URL`, either in the shell (checked first) or in `backend/.env`:
+
+```
+TEST_DATABASE_URL=postgresql+psycopg://inferenceflow_test:test-only-password@localhost:15432/inferenceflow_test
+```
+
+Pytest stops before running any test if `TEST_DATABASE_URL`:
+
+- is missing (it **never** falls back to `DATABASE_URL`),
+- names a database that doesn't end in `_test`, or
+- points at the same server (host and port) as `DATABASE_URL`, or
+- reaches a database without the test identity marker (see below).
+
+### Identity marker
+
+Pytest also checks, **before migrating or truncating anything**, that the database is really the
+`test-db` container. That database carries the comment `inferenceflow-test-db`, which
+`docker/test-db/initdb/01-identity.sql` sets when the container first initializes its volume.
+A database without that marker (another project's server, say) is refused. Pytest only reads
+the marker; it never sets it.
+
+A test volume created before this marker existed needs it applied once, inside the test
+container. Never run this against the development database:
+
+```bash
+docker compose up -d --wait test-db    # recreates test-db with the init script mounted
+docker exec inferenceflow-test-db psql -v ON_ERROR_STOP=1 -U inferenceflow_test -d inferenceflow_test \
+    -f /docker-entrypoint-initdb.d/01-identity.sql
+```
+
+### Start the test database
+
+```bash
+docker compose up -d --wait test-db     # starts only test-db and waits for its health check
+```
+
+### Run the tests
+
+```bash
+cd backend
+source env/bin/activate
+pip install -r requirements-dev.txt
+python -m pytest
+```
+
+At the start of every run, pytest checks that the test database is reachable and carries the
+identity marker. It then applies
+the Alembic migrations (`alembic upgrade head`) and empties the application tables. It never
+empties `alembic_version`, and never creates or drops databases. Tests can run while a
+development server is using the development database.
+
+To check migrations against the test database:
+
+```bash
+DATABASE_URL="$TEST_DATABASE_URL" alembic check
+```
+
+### Stop the test database
+
+```bash
+docker compose stop test-db
+```
+
+### Reset the test database
+
+Only needed if the test database gets into a bad state, for example after editing a migration
+that was already applied. The recreated volume gets the identity marker automatically:
+
+```bash
+docker compose rm --stop --force test-db
+docker volume rm inference_flow_test_postgres_data
+docker compose up -d --wait test-db
+```
+
+> **Do not use `docker compose down -v`.** It removes *every* volume in this project, including
+> `inference_flow_postgres_data`, and deletes the development database.
