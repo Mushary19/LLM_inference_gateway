@@ -32,9 +32,6 @@ async def create_inference_engine() -> InferenceEngine:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    # Gateway path (/v1/chat/completions): calls the provider directly.
-    app.state.chat_provider = create_provider(settings.chat_provider)
-
     # Legacy path (/generate): one engine per process, used for token counting and by the scheduler.
     inference_engine = await create_inference_engine()
     app.state.inference_engine = inference_engine
@@ -58,11 +55,24 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         scheduler.start()
     app.state.scheduler = scheduler
     app.state.gpu_memory = gpu_memory
+
+    # Gateway path (/v1/chat/completions): calls the provider directly.
+    api_key = settings.openai_compatible_api_key
+    chat_provider = create_provider(
+        settings.chat_provider,
+        base_url=settings.openai_compatible_base_url,
+        api_key=api_key.get_secret_value() if api_key else None,
+        timeout_seconds=settings.openai_compatible_timeout_seconds,
+    )
+    app.state.chat_provider = chat_provider
     try:
         yield
     finally:
-        if scheduler is not None:
-            await scheduler.stop()
+        try:
+            if scheduler is not None:
+                await scheduler.stop()
+        finally:
+            await chat_provider.aclose()
 
 
 app = FastAPI(title="InferenceFlow", lifespan=lifespan)

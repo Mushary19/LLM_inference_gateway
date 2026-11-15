@@ -24,6 +24,14 @@ def simulated_inference_engine(monkeypatch):
     monkeypatch.setattr(settings, "inference_engine", "simulated")
 
 
+@pytest.fixture(autouse=True)
+def fake_chat_provider(monkeypatch):
+    """Never call a real provider (or send a real API key) from tests, whatever .env configures."""
+    monkeypatch.setattr(settings, "chat_provider", "fake")
+    monkeypatch.setattr(settings, "openai_compatible_base_url", "http://localhost:11434/v1")
+    monkeypatch.setattr(settings, "openai_compatible_api_key", None)
+
+
 @pytest.fixture
 def db_session() -> Generator[Session, None, None]:
     """Session inside an outer transaction that is rolled back after each test.

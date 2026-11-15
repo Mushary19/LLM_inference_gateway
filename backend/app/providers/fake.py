@@ -65,6 +65,9 @@ class FakeProvider:
             return HealthStatus(healthy=False, detail=str(self.fail_with))
         return HealthStatus(healthy=True)
 
+    async def aclose(self) -> None:
+        pass
+
     async def _complete(self, request: ChatRequest) -> tuple[list[str], FinishReason]:
         if self.delay_seconds:
             await asyncio.sleep(self.delay_seconds)
