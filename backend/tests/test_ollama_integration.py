@@ -15,6 +15,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from app.core.config import settings
+from app.database.connection import get_db
 from app.main import app
 from app.providers.base import ChatMessage, ChatRequest, ModelNotFoundError
 from app.providers.openai_compatible import OpenAICompatibleProvider
@@ -58,16 +59,20 @@ def test_provider_against_real_ollama():
     assert response.finish_reason in ("stop", "length")
 
 
-def test_chat_completions_endpoint_against_real_ollama(monkeypatch):
+def test_chat_completions_endpoint_against_real_ollama(monkeypatch, db_session, auth_headers):
     monkeypatch.setattr(settings, "chat_provider", "openai_compatible")
     monkeypatch.setattr(settings, "openai_compatible_base_url", BASE_URL)
     monkeypatch.setattr(settings, "openai_compatible_timeout_seconds", 300)
+    app.dependency_overrides[get_db] = lambda: db_session
 
-    with TestClient(app) as client:
-        response = client.post(
-            "/v1/chat/completions",
-            json={"model": MODEL, "messages": [{"role": "user", "content": "Say hi"}], "max_tokens": 10},
-        )
+    try:
+        with TestClient(app, headers=auth_headers) as client:
+            response = client.post(
+                "/v1/chat/completions",
+                json={"model": MODEL, "messages": [{"role": "user", "content": "Say hi"}], "max_tokens": 10},
+            )
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
     assert response.status_code == 200, response.text
     body = response.json()

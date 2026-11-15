@@ -4,6 +4,7 @@ from sqlalchemy import func, select
 
 from app.api.chat import get_chat_provider
 from app.core.config import settings
+from app.database.connection import get_db
 from app.database.models import InferenceRequest
 from app.main import app
 from app.providers.base import (
@@ -22,6 +23,13 @@ from app.services.admission import AdmissionController
 
 URL = "/v1/chat/completions"
 BODY = {"model": FAKE_MODEL, "messages": [{"role": "user", "content": "What is KV caching?"}]}
+
+
+@pytest.fixture
+def client(client, auth_headers):
+    """Requests in this module are authenticated; authentication itself is tested in test_auth.py."""
+    client.headers.update(auth_headers)
+    return client
 
 
 @pytest.fixture
@@ -169,7 +177,7 @@ def test_provider_errors_map_to_http_status(client, use_provider, error, expecte
     assert response.json() == {"detail": str(error)}
 
 
-def test_unexpected_provider_exception_is_a_500(use_provider):
+def test_unexpected_provider_exception_is_a_500(use_provider, db_session, auth_headers):
     class BrokenProvider:
         name = "broken"
 
@@ -177,9 +185,13 @@ def test_unexpected_provider_exception_is_a_500(use_provider):
             raise RuntimeError("bug in provider")
 
     use_provider(BrokenProvider())
+    app.dependency_overrides[get_db] = lambda: db_session
 
-    with TestClient(app, raise_server_exceptions=False) as client:
-        response = client.post(URL, json=BODY)
+    try:
+        with TestClient(app, raise_server_exceptions=False, headers=auth_headers) as client:
+            response = client.post(URL, json=BODY)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
     assert response.status_code == 500
 

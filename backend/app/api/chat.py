@@ -1,7 +1,8 @@
-"""Gateway endpoint: POST /v1/chat/completions.
+"""Gateway endpoints: POST /v1/chat/completions and GET /v1/models.
 
-Calls the configured provider directly. It does not use the legacy /generate pipeline
-(admission controller, PostgreSQL queue, scheduler, simulated GPU memory).
+Every /v1 route requires an API key (Authorization: Bearer <key>); authentication runs
+before the route, so a rejected request never reaches the provider. The routes call the
+configured provider directly, not the legacy /generate pipeline.
 """
 
 import logging
@@ -10,6 +11,7 @@ import uuid
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
+from app.api.auth import AuthenticatedClient, require_api_key
 from app.providers.base import (
     ChatMessage,
     ChatRequest,
@@ -27,11 +29,15 @@ from app.schemas.chat import (
     ChatCompletionResponse,
     ChatMessageOut,
     ChatUsage,
+    ModelList,
+    ModelObject,
 )
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/v1")
+# Router-level dependency: every route added here is authenticated by default. Routes that
+# need the client also declare require_api_key; FastAPI resolves it once per request.
+router = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
 
 # Most specific first; anything else from a provider is a bad gateway.
 _ERROR_STATUS: list[tuple[type[ProviderError], int]] = [
@@ -45,6 +51,15 @@ _ERROR_STATUS: list[tuple[type[ProviderError], int]] = [
 def get_chat_provider(request: Request) -> Provider:
     """The provider created at startup. Tests override this dependency."""
     return request.app.state.chat_provider
+
+
+def _provider_http_error(provider: Provider, exc: ProviderError) -> HTTPException:
+    status_code = next(
+        (code for error_type, code in _ERROR_STATUS if isinstance(exc, error_type)),
+        status.HTTP_502_BAD_GATEWAY,
+    )
+    logger.warning("Provider %s failed (%s): %s", provider.name, type(exc).__name__, exc)
+    return HTTPException(status_code=status_code, detail=str(exc) or type(exc).__name__)
 
 
 def _to_provider_request(body: ChatCompletionRequest) -> ChatRequest:
@@ -80,15 +95,25 @@ def _to_http_response(response: ChatResponse) -> ChatCompletionResponse:
 
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
-    body: ChatCompletionRequest, provider: Provider = Depends(get_chat_provider)
+    body: ChatCompletionRequest,
+    provider: Provider = Depends(get_chat_provider),
+    client: AuthenticatedClient = Depends(require_api_key),
 ) -> ChatCompletionResponse:
+    logger.info(
+        "Chat completion for application %s (key %s), model %s",
+        client.application_name, client.key_prefix, body.model,
+    )
     try:
         response = await provider.chat(_to_provider_request(body))
     except ProviderError as exc:
-        status_code = next(
-            (code for error_type, code in _ERROR_STATUS if isinstance(exc, error_type)),
-            status.HTTP_502_BAD_GATEWAY,
-        )
-        logger.warning("Provider %s failed (%s): %s", provider.name, type(exc).__name__, exc)
-        raise HTTPException(status_code=status_code, detail=str(exc) or type(exc).__name__)
+        raise _provider_http_error(provider, exc)
     return _to_http_response(response)
+
+
+@router.get("/models", response_model=ModelList)
+async def list_models(provider: Provider = Depends(get_chat_provider)) -> ModelList:
+    try:
+        models = await provider.list_models()
+    except ProviderError as exc:
+        raise _provider_http_error(provider, exc)
+    return ModelList(data=[ModelObject(id=m.id, owned_by=m.owned_by) for m in models])

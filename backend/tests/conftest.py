@@ -2,6 +2,7 @@ import os
 import sys
 from collections.abc import Generator
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -33,7 +34,9 @@ from sqlalchemy.orm import Session  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.database.base import Base  # noqa: E402
 from app.database.connection import engine, get_db  # noqa: E402
+from app.database.models import ApiKey  # noqa: E402
 from app.main import app  # noqa: E402
+from app.services.api_keys import create_api_key, create_application  # noqa: E402
 
 if (engine.url.database, engine.url.port) != (TEST_DATABASE.database, TEST_DATABASE.port):
     pytest.exit("the application engine is not bound to TEST_DATABASE_URL", returncode=4)
@@ -117,6 +120,25 @@ def db_session() -> Generator[Session, None, None]:
         session.close()
         transaction.rollback()
         connection.close()
+
+
+class IssuedKey(NamedTuple):
+    plaintext: str
+    record: ApiKey
+
+
+@pytest.fixture
+def api_key(db_session: Session) -> IssuedKey:
+    """An active API key for application "test-app", inside the rolled-back test session."""
+    application = create_application(db_session, "test-app")
+    record, plaintext = create_api_key(db_session, application, "test-key")
+    db_session.commit()
+    return IssuedKey(plaintext, record)
+
+
+@pytest.fixture
+def auth_headers(api_key: IssuedKey) -> dict[str, str]:
+    return {"Authorization": f"Bearer {api_key.plaintext}"}
 
 
 @pytest.fixture

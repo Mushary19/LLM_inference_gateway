@@ -55,6 +55,19 @@ class ChatUsage(BaseModel):
     total_tokens: int
 
 
+class ModelObject(BaseModel):
+    id: str
+    object: Literal["model"] = "model"
+    # Providers don't report creation times through the normalized interface.
+    created: int = 0
+    owned_by: str
+
+
+class ModelList(BaseModel):
+    object: Literal["list"] = "list"
+    data: list[ModelObject]
+
+
 class ChatCompletionResponse(BaseModel):
     id: str
     object: Literal["chat.completion"] = "chat.completion"

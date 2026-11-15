@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     CheckConstraint,
     DateTime,
     Enum,
@@ -16,6 +17,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    String,
     Text,
     UniqueConstraint,
     Uuid,
@@ -168,3 +170,64 @@ class RequestMetrics(Base):
     )
 
     request: Mapped[InferenceRequest] = relationship(back_populates="metrics")
+
+
+class ClientApplication(Base):
+    """A client application that calls the gateway. API keys belong to an application."""
+
+    __tablename__ = "client_applications"
+    __table_args__ = (
+        UniqueConstraint("name", name="uq_client_applications_name"),
+        CheckConstraint("length(trim(name)) > 0", name="ck_client_applications_name_not_blank"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()")
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    api_keys: Mapped[list["ApiKey"]] = relationship(back_populates="application")
+
+
+class ApiKey(Base):
+    """An API key. Only the SHA-256 hash of the full key is stored, never the key itself.
+
+    key_prefix (e.g. "if_k3F9xQ2m") is the non-secret part of the key, used to identify it
+    in listings and revocation. Authentication looks keys up by key_hash only.
+    """
+
+    __tablename__ = "api_keys"
+    __table_args__ = (
+        UniqueConstraint("key_prefix", name="uq_api_keys_key_prefix"),
+        UniqueConstraint("key_hash", name="uq_api_keys_key_hash"),
+        CheckConstraint("key_hash ~ '^[0-9a-f]{64}$'", name="ck_api_keys_key_hash_sha256_hex"),
+        CheckConstraint("length(trim(name)) > 0", name="ck_api_keys_name_not_blank"),
+        CheckConstraint(
+            "(is_active AND revoked_at IS NULL) OR (NOT is_active AND revoked_at IS NOT NULL)",
+            name="ck_api_keys_revocation_consistent",
+        ),
+        Index("ix_api_keys_application_id", "application_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()")
+    )
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("client_applications.id", name="fk_api_keys_application_id_client_applications"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    key_prefix: Mapped[str] = mapped_column(String(32), nullable=False)
+    key_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    is_active: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    application: Mapped[ClientApplication] = relationship(back_populates="api_keys")

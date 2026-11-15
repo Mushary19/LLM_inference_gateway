@@ -194,6 +194,74 @@ measure or limit the real CPU RAM used by PyTorch, and the KV-block sizing doesn
 Qwen's architecture. A request can be refused for lack of simulated KV blocks while plenty of
 RAM is free, or the process can use more RAM than the simulation suggests.
 
+## API key authentication
+
+The gateway endpoints require an API key:
+
+| Endpoint | Authentication |
+|---|---|
+| `POST /v1/chat/completions` | **API key required** |
+| `GET /v1/models` | **API key required** |
+| `POST /generate` | **None.** Legacy, unprotected endpoint (see below) |
+
+Send the key as a Bearer token:
+
+```bash
+curl localhost:8000/v1/models -H "Authorization: Bearer $INFERENCEFLOW_API_KEY"
+```
+
+A missing, malformed, unknown or revoked key gets `401` with `WWW-Authenticate: Bearer` and the
+same `{"detail": "Missing or invalid API key"}`, so the response doesn't reveal whether a key
+ever existed. Authentication runs before the request body is validated and before any provider
+call.
+
+### Keys and applications
+
+Every key belongs to a **client application**. A key looks like `if_k3F9xQ2m_<43 random
+characters>`:
+
+- `if_k3F9xQ2m` is the **key prefix**. It isn't secret; it identifies the key in listings and
+  revocation.
+- The rest is the secret (256 bits).
+- Only the SHA-256 hash of the whole key is stored. The plaintext is shown once, when the key is
+  created, and can't be recovered afterwards.
+
+### Managing keys
+
+Run from `backend/`. The commands act on the database in `DATABASE_URL`:
+
+```bash
+python -m app.cli create-app billing-service
+python -m app.cli create-key --app billing-service --name production   # prints the key once
+python -m app.cli list-keys [--app billing-service]                     # never shows secrets
+python -m app.cli revoke-key if_k3F9xQ2m                                # takes effect immediately
+```
+
+`create-key` refuses unknown applications, so create the application first. There are no HTTP
+endpoints for managing keys.
+
+### Applying the schema to the development database
+
+The API key tables come from migration `a2916f33ef9c`. Neither the test suite nor any automated
+step migrates the development database, so apply it yourself when you're ready. Until then,
+`/v1/*` requests against the development server fail, because the tables don't exist.
+
+```bash
+cd backend
+alembic current          # expect 681491804915
+alembic upgrade head     # creates client_applications and api_keys
+alembic current          # expect a2916f33ef9c (head)
+```
+
+The migration only adds two tables and changes no existing data. `alembic downgrade 681491804915`
+removes them again, along with every key.
+
+### Legacy `/generate` is not protected
+
+`POST /generate` (the original queue and scheduler pipeline) does **not** require an API key and
+is kept only for compatibility. Don't expose it to untrusted networks. Client applications should
+use `/v1/chat/completions`.
+
 ## Testing
 
 Automated tests run against their own PostgreSQL container, `test-db`, and never touch the

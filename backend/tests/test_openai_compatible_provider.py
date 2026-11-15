@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 
 from app.api.chat import get_chat_provider
 from app.core.config import settings
+from app.database.connection import get_db
 from app.main import app
 from app.providers import openai_compatible
 from app.providers.base import (
@@ -370,15 +371,17 @@ def test_app_creates_and_closes_the_configured_provider(monkeypatch):
 
 
 @pytest.fixture
-def client_with_upstream():
-    """The real app with an OpenAICompatibleProvider whose HTTP calls go to a mock upstream."""
+def client_with_upstream(db_session, auth_headers):
+    """The real app (authenticated) with an OpenAICompatibleProvider talking to a mock upstream."""
 
     def build(upstream: Upstream) -> TestClient:
         app.dependency_overrides[get_chat_provider] = lambda: make_provider(upstream)
-        return TestClient(app)
+        app.dependency_overrides[get_db] = lambda: db_session
+        return TestClient(app, headers=auth_headers)
 
     yield build
     app.dependency_overrides.pop(get_chat_provider, None)
+    app.dependency_overrides.pop(get_db, None)
 
 
 URL = "/v1/chat/completions"
