@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
@@ -10,8 +11,21 @@ from app.core.config import settings
 from app.database.connection import SessionLocal
 from app.providers.factory import create_provider
 from app.services.inference import InferenceEngine, SimulatedInferenceEngine
+from app.services.rate_limit import TokenBucketRateLimiter, create_redis_client
 from app.services.resources import GpuMemoryManager, KvCacheSizer
 from app.services.scheduler import Scheduler
+
+logger = logging.getLogger(__name__)
+
+
+def create_rate_limiter() -> TokenBucketRateLimiter:
+    """One Redis client and connection pool for the process, shared by all requests."""
+    redis = create_redis_client(settings.redis_url, settings.redis_timeout_seconds)
+    return TokenBucketRateLimiter(
+        redis,
+        requests_per_minute=settings.rate_limit_requests_per_minute,
+        burst=settings.rate_limit_burst,
+    )
 
 
 async def create_inference_engine() -> InferenceEngine:
@@ -65,6 +79,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         timeout_seconds=settings.openai_compatible_timeout_seconds,
     )
     app.state.chat_provider = chat_provider
+    rate_limiter = create_rate_limiter()
+    app.state.rate_limiter = rate_limiter
     try:
         yield
     finally:
@@ -72,7 +88,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             if scheduler is not None:
                 await scheduler.stop()
         finally:
-            await chat_provider.aclose()
+            try:
+                await chat_provider.aclose()
+            finally:
+                try:
+                    await rate_limiter.aclose()
+                except Exception:
+                    logger.exception("Failed to close the Redis rate-limit client")
 
 
 app = FastAPI(title="InferenceFlow", lifespan=lifespan)

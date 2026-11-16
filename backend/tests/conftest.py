@@ -12,6 +12,12 @@ from database_guard import (
     check_database_identity,
     configure_test_database,
 )
+from redis_guard import (
+    TEST_REDIS_IDENTITY_KEY,
+    UnsafeTestRedisError,
+    check_redis_identity,
+    configure_test_redis,
+)
 
 BACKEND_DIR = Path(__file__).resolve().parents[1]
 
@@ -24,6 +30,13 @@ try:
 except UnsafeTestDatabaseError as exc:
     pytest.exit(f"Refusing to run tests: {exc}", returncode=4)
 
+# Same for Redis: point the app's REDIS_URL at TEST_REDIS_URL.
+try:
+    TEST_REDIS_URL = configure_test_redis(os.environ, BACKEND_DIR / ".env")
+except UnsafeTestRedisError as exc:
+    pytest.exit(f"Refusing to run tests: {exc}", returncode=4)
+
+import redis  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
@@ -40,6 +53,43 @@ from app.services.api_keys import create_api_key, create_application  # noqa: E4
 
 if (engine.url.database, engine.url.port) != (TEST_DATABASE.database, TEST_DATABASE.port):
     pytest.exit("the application engine is not bound to TEST_DATABASE_URL", returncode=4)
+if settings.redis_url != TEST_REDIS_URL:
+    pytest.exit("the application is not configured with TEST_REDIS_URL", returncode=4)
+
+RATE_LIMIT_KEY_PATTERN = "inferenceflow:ratelimit:*"
+
+
+def delete_rate_limit_keys(client: redis.Redis) -> int:
+    """Delete only rate-limit buckets (tests create them), never the identity marker or anything else."""
+    deleted = 0
+    for key in client.scan_iter(match=RATE_LIMIT_KEY_PATTERN, count=500):
+        deleted += client.unlink(key)
+    return deleted
+
+
+@pytest.fixture(scope="session", autouse=True)
+def prepared_test_redis() -> Generator[None, None, None]:
+    """Once per session: check test-redis is reachable and carries its identity marker, then
+    remove leftover rate-limit buckets. The identity check runs before anything is deleted."""
+    client = redis.Redis.from_url(TEST_REDIS_URL, socket_connect_timeout=3, socket_timeout=3)
+    try:
+        try:
+            marker = client.get(TEST_REDIS_IDENTITY_KEY)
+        except redis.RedisError as exc:
+            pytest.exit(
+                f"Test Redis is not reachable at {TEST_REDIS_URL}: {exc}\n"
+                "Start it with: docker compose up -d --wait test-redis",
+                returncode=4,
+            )
+        try:
+            check_redis_identity(marker)
+        except UnsafeTestRedisError as exc:
+            pytest.exit(f"Refusing to run tests against {TEST_REDIS_URL}: {exc}", returncode=4)
+        delete_rate_limit_keys(client)
+        yield
+        delete_rate_limit_keys(client)
+    finally:
+        client.close()
 
 
 @pytest.fixture(scope="session", autouse=True)

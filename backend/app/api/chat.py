@@ -1,8 +1,8 @@
 """Gateway endpoints: POST /v1/chat/completions and GET /v1/models.
 
-Every /v1 route requires an API key (Authorization: Bearer <key>); authentication runs
-before the route, so a rejected request never reaches the provider. The routes call the
-configured provider directly, not the legacy /generate pipeline.
+Every /v1 route requires an API key (Authorization: Bearer <key>) and is rate-limited per
+key. Both checks run before the route, so a rejected request never reaches the provider.
+The routes call the configured provider directly, not the legacy /generate pipeline.
 """
 
 import logging
@@ -12,6 +12,7 @@ import uuid
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 
 from app.api.auth import AuthenticatedClient, require_api_key
+from app.api.rate_limit import enforce_rate_limit
 from app.providers.base import (
     ChatMessage,
     ChatRequest,
@@ -35,9 +36,10 @@ from app.schemas.chat import (
 
 logger = logging.getLogger(__name__)
 
-# Router-level dependency: every route added here is authenticated by default. Routes that
-# need the client also declare require_api_key; FastAPI resolves it once per request.
-router = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key)])
+# Router-level dependencies: every route added here is authenticated, then rate-limited, by
+# default. enforce_rate_limit depends on require_api_key, and routes that need the client
+# declare it too; FastAPI resolves it once per request, so the key is looked up only once.
+router = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)])
 
 # Most specific first; anything else from a provider is a bad gateway.
 _ERROR_STATUS: list[tuple[type[ProviderError], int]] = [

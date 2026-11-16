@@ -52,6 +52,14 @@ class Settings(BaseSettings):
     # Covers the whole request including generation, which is slow on CPU.
     openai_compatible_timeout_seconds: float = Field(default=120.0, gt=0)
 
+    # Per-API-key rate limiting (token bucket in Redis). The default URL is the docker-compose
+    # "redis" service as seen from the host-run backend; inside Compose use redis://redis:6379/0.
+    redis_url: str = "redis://localhost:16379/0"
+    # Connect and per-command timeout. If Redis can't answer in time, /v1 requests get 503.
+    redis_timeout_seconds: float = Field(default=0.5, gt=0)
+    rate_limit_requests_per_minute: int = Field(default=60, gt=0)  # sustained refill rate
+    rate_limit_burst: int = Field(default=10, gt=0)  # bucket capacity
+
     @model_validator(mode="after")
     def _check_gpu_memory(self) -> "Settings":
         if self.gpu_total_memory_mb <= self.gpu_model_memory_mb + self.gpu_runtime_memory_mb:

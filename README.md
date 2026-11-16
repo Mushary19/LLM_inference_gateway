@@ -262,6 +262,76 @@ removes them again, along with every key.
 is kept only for compatibility. Don't expose it to untrusted networks. Client applications should
 use `/v1/chat/completions`.
 
+## Rate limiting
+
+Every `/v1` request is rate-limited **per API key**, after the key is authenticated:
+
+| Endpoint | Authentication | Rate limit |
+|---|---|---|
+| `POST /v1/chat/completions` | API key | per key |
+| `GET /v1/models` | API key | per key |
+| any future `/v1` route | API key (inherited) | per key (inherited) |
+| `POST /generate` | **none** | **none** (legacy, see above) |
+
+### How it works
+
+Each key has a **token bucket** in Redis under `inferenceflow:ratelimit:<api key ID>` (never
+the key itself):
+
+- The bucket holds up to `RATE_LIMIT_BURST` tokens and refills continuously at
+  `RATE_LIMIT_REQUESTS_PER_MINUTE / 60` tokens per second.
+- Each request takes one token. A key can burst up to the capacity, then sustain the
+  per-minute rate.
+- The whole check (read, refill, consume, write, set expiry) is **one Lua script**, which Redis
+  runs atomically. Concurrent requests, from any number of workers, can't take more tokens than
+  the bucket holds.
+- The script uses Redis's own clock, so workers with different clocks agree.
+- Idle buckets expire once they would be full again anyway.
+
+Order of checks for a `/v1` request: authenticate the key (401), then check the rate limit (429
+or 503), then validate the body (422), then call the provider. A rejected request never reaches
+the provider, and an unauthenticated one never reaches Redis.
+
+### Responses
+
+Accepted requests include:
+
+| Header | Meaning |
+|---|---|
+| `X-RateLimit-Limit` | bucket capacity (`RATE_LIMIT_BURST`) |
+| `X-RateLimit-Remaining` | whole tokens left after this request |
+| `X-RateLimit-Reset` | seconds until the bucket is full again |
+
+When a key is out of tokens, the response is **`429 Too Many Requests`** with
+`{"detail": "Rate limit exceeded"}`, the headers above, and `Retry-After` (seconds until the next
+token, rounded up).
+
+If Redis is unreachable or doesn't answer within `REDIS_TIMEOUT_SECONDS`, rate limiting
+**fails closed**: the request gets **`503`** with `{"detail": "Rate limiting is temporarily
+unavailable"}` and is not passed to the provider.
+
+### Configuration
+
+| Variable | Default | |
+|---|---|---|
+| `REDIS_URL` | `redis://localhost:16379/0` | the `redis` Compose service, from the host-run backend |
+| `REDIS_TIMEOUT_SECONDS` | `0.5` | connect and command timeout |
+| `RATE_LIMIT_REQUESTS_PER_MINUTE` | `60` | sustained rate per key |
+| `RATE_LIMIT_BURST` | `10` | bucket capacity per key |
+
+The backend runs on the host, so it reaches Redis on the published port: `redis://localhost:16379/0`.
+If the backend is ever run **inside** Docker Compose, use the service name instead:
+`redis://redis:6379/0`. The limits are global settings, enforced separately for each key.
+
+### Start Redis
+
+```bash
+docker compose up -d --wait redis          # development Redis on localhost:16379
+```
+
+Rate-limit state is short-lived, so this Redis keeps nothing on disk. Restarting it resets every
+bucket.
+
 ## Testing
 
 Automated tests run against their own PostgreSQL container, `test-db`, and never touch the
@@ -289,6 +359,30 @@ Pytest stops before running any test if `TEST_DATABASE_URL`:
 - points at the same server (host and port) as `DATABASE_URL`, or
 - reaches a database without the test identity marker (see below).
 
+### Test Redis
+
+Tests use their own Redis container, `test-redis` (host port **16380**), never the development
+`redis` (16379). Set `TEST_REDIS_URL` in the shell or `backend/.env`:
+
+```
+TEST_REDIS_URL=redis://localhost:16380/0
+```
+
+Pytest stops before any test runs if `TEST_REDIS_URL` is missing (it **never** falls back to
+`REDIS_URL`), or points at the same Redis server (host and port) as `REDIS_URL`. A different
+database number on the same server isn't accepted.
+
+Before touching anything, pytest also checks that the server carries the key
+`inferenceflow:test-redis:identity` = `inferenceflow-test-redis`.
+`docker/test-redis/start.sh` sets it each time the container starts, and pytest only reads it.
+Pytest then deletes only rate-limit buckets (`inferenceflow:ratelimit:*`), at the start and end
+of the run. It never flushes the server.
+
+```bash
+docker compose up -d --wait test-redis     # start
+docker compose stop test-redis             # stop
+```
+
 ### Identity marker
 
 Pytest also checks, **before migrating or truncating anything**, that the database is really the
@@ -309,7 +403,7 @@ docker exec inferenceflow-test-db psql -v ON_ERROR_STOP=1 -U inferenceflow_test 
 ### Start the test database
 
 ```bash
-docker compose up -d --wait test-db     # starts only test-db and waits for its health check
+docker compose up -d --wait test-db test-redis   # the test database and test Redis
 ```
 
 ### Run the tests
