@@ -3,11 +3,17 @@
 Every /v1 route requires an API key (Authorization: Bearer <key>) and is rate-limited per
 key (see app/api/v1.py). Both checks run before the route, so a rejected request never
 reaches the provider. Chat completions also reserve token quota before calling the provider
-and settle it afterwards (see app/services/quota.py). The routes call the configured
-provider directly, not the legacy /generate pipeline.
+and settle it afterwards (see app/services/quota.py). The routes call providers directly,
+not the legacy /generate pipeline.
+
+Routing: the request's public model ID is resolved in the model registry
+(app/providers/registry.py) to a provider instance and that provider's own model ID. Clients
+only ever see public IDs. Provider-specific model IDs, provider URLs and upstream error
+details stay in the server logs.
 """
 
 import logging
+import re
 import time
 import uuid
 
@@ -26,7 +32,6 @@ from app.providers.base import (
     ChatResponse,
     InvalidProviderRequestError,
     ModelNotFoundError,
-    Provider,
     ProviderError,
     ProviderTimeoutError,
     ProviderUnavailableError,
@@ -41,36 +46,81 @@ from app.schemas.chat import (
     ModelList,
     ModelObject,
 )
+from app.providers.registry import ModelRegistry, ModelRoute, UnknownModelError
 from app.services import quota
 
 logger = logging.getLogger(__name__)
 
-# Most specific first; anything else from a provider is a bad gateway.
-_ERROR_STATUS: list[tuple[type[ProviderError], int]] = [
-    (ModelNotFoundError, status.HTTP_404_NOT_FOUND),
-    (InvalidProviderRequestError, status.HTTP_400_BAD_REQUEST),
-    (ProviderTimeoutError, status.HTTP_504_GATEWAY_TIMEOUT),
-    (ProviderUnavailableError, status.HTTP_503_SERVICE_UNAVAILABLE),
+# Most specific first; anything else from a provider is a bad gateway. Public messages are
+# fixed: upstream details (URLs, provider model IDs, response bodies) go to the logs only.
+# A ModelNotFoundError here means the registry routed a public model to a provider that
+# doesn't serve it, which is a gateway configuration problem, not a client error.
+_ERROR_RESPONSES: list[tuple[type[ProviderError], int, str]] = [
+    (ModelNotFoundError, status.HTTP_502_BAD_GATEWAY, "The provider could not serve the requested model."),
+    (InvalidProviderRequestError, status.HTTP_400_BAD_REQUEST, "The provider rejected the request as invalid."),
+    (ProviderTimeoutError, status.HTTP_504_GATEWAY_TIMEOUT, "The provider did not respond in time."),
+    (ProviderUnavailableError, status.HTTP_503_SERVICE_UNAVAILABLE, "The provider is temporarily unavailable."),
 ]
+_DEFAULT_ERROR_RESPONSE = (status.HTTP_502_BAD_GATEWAY, "The provider returned an unexpected response.")
+
+MODEL_NOT_FOUND = {"code": "model_not_found", "message": "The requested model was not found."}
+MODEL_OWNER = "inferenceflow"
+
+# Sanitizing upstream 400 messages, which clients need (e.g. "context length exceeded").
+_ADAPTER_PREFIX = re.compile(r"^provider returned HTTP \d{3}:\s*")
+_URL = re.compile(r"\b[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+_IPV4 = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b")
+_CONTROL_AND_SPACE = re.compile(r"[\s\x00-\x1f\x7f]+")
+_MAX_PUBLIC_MESSAGE_CHARS = 300
 
 
-def get_chat_provider(request: Request) -> Provider:
-    """The provider created at startup. Tests override this dependency."""
-    return request.app.state.chat_provider
+def get_model_registry(request: Request) -> ModelRegistry:
+    """The registry built at startup. Tests override this dependency."""
+    return request.app.state.model_registry
 
 
-def _provider_http_error(provider: Provider, exc: ProviderError) -> HTTPException:
-    status_code = next(
-        (code for error_type, code in _ERROR_STATUS if isinstance(exc, error_type)),
-        status.HTTP_502_BAD_GATEWAY,
+def sanitize_upstream_message(message: str, route: ModelRoute) -> str:
+    """Make an upstream rejection message safe to show to the client.
+
+    Drops the adapter's "provider returned HTTP nnn:" prefix, replaces the provider's model
+    ID with the public one, redacts URLs and IP addresses, removes control characters and
+    caps the length.
+    """
+    text = _ADAPTER_PREFIX.sub("", message)
+    if route.provider_model_id != route.public_id:
+        text = text.replace(route.provider_model_id, route.public_id)
+    text = _URL.sub("[redacted]", text)
+    text = _IPV4.sub("[redacted]", text)
+    text = _CONTROL_AND_SPACE.sub(" ", text).strip()
+    if len(text) > _MAX_PUBLIC_MESSAGE_CHARS:
+        text = text[: _MAX_PUBLIC_MESSAGE_CHARS - 3].rstrip() + "..."
+    return text
+
+
+def _provider_http_error(route: ModelRoute, exc: ProviderError) -> HTTPException:
+    status_code, message = next(
+        ((code, text) for error_type, code, text in _ERROR_RESPONSES if isinstance(exc, error_type)),
+        _DEFAULT_ERROR_RESPONSE,
     )
-    logger.warning("Provider %s failed (%s): %s", provider.name, type(exc).__name__, exc)
-    return HTTPException(status_code=status_code, detail=str(exc) or type(exc).__name__)
+    if isinstance(exc, ModelNotFoundError):
+        logger.error(
+            "Provider %s does not serve model %r (public model %s); check the model registry: %s",
+            route.provider.name, route.provider_model_id, route.public_id, exc,
+        )
+    else:
+        logger.warning(
+            "Provider %s failed for model %s (%s): %s", route.provider.name, route.public_id, type(exc).__name__, exc
+        )
+    if isinstance(exc, InvalidProviderRequestError):
+        upstream = sanitize_upstream_message(str(exc), route)
+        if upstream:
+            message = f"The provider rejected the request: {upstream}"
+    return HTTPException(status_code=status_code, detail=message)
 
 
-def _to_provider_request(body: ChatCompletionRequest) -> ChatRequest:
+def _to_provider_request(body: ChatCompletionRequest, route: ModelRoute) -> ChatRequest:
     return ChatRequest(
-        model=body.model,
+        model=route.provider_model_id,
         messages=tuple(ChatMessage(role=m.role, content=m.content) for m in body.messages),
         max_tokens=body.max_tokens,
         temperature=body.temperature,
@@ -78,13 +128,14 @@ def _to_provider_request(body: ChatCompletionRequest) -> ChatRequest:
     )
 
 
-def _to_http_response(response: ChatResponse, request_id: uuid.UUID) -> ChatCompletionResponse:
+def _to_http_response(response: ChatResponse, request_id: uuid.UUID, public_model: str) -> ChatCompletionResponse:
     return ChatCompletionResponse(
         # The gateway assigns the ID (its request ID, also used for quota and usage records)
         # and timestamp; providers stay deterministic.
         id=f"chatcmpl-{request_id.hex}",
         created=int(time.time()),
-        model=response.model,
+        # Always the public ID the client asked for, never the upstream's own model name.
+        model=public_model,
         choices=[
             ChatChoice(
                 index=0,
@@ -148,7 +199,7 @@ async def _settle(
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     body: ChatCompletionRequest,
-    provider: Provider = Depends(get_chat_provider),
+    registry: ModelRegistry = Depends(get_model_registry),
     client: AuthenticatedClient = Depends(require_api_key),
     db: Session = Depends(get_db),
 ) -> ChatCompletionResponse:
@@ -156,12 +207,21 @@ async def chat_completions(
         "Chat completion for application %s (key %s), model %s",
         client.application_name, client.key_prefix, body.model,
     )
+    # Resolved before any quota work: an unknown model creates no reservation or usage record.
+    try:
+        route = registry.resolve(body.model)
+    except UnknownModelError as exc:
+        logger.info("Rejected request for application %s: %s", client.application_name, exc)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=MODEL_NOT_FOUND) from exc
+
     request_id = uuid.uuid4()
-    provider_request = _to_provider_request(body)
+    provider = route.provider
+    provider_request = _to_provider_request(body, route)
     estimate = quota.estimate_request_tokens(
         provider_request.messages, body.max_tokens or settings.max_generation_tokens
     )
     # Transaction 1 (commits, releasing the connection before the provider call).
+    # Usage is recorded under the provider instance name and the public model ID.
     try:
         reservation = await run_in_threadpool(
             quota.reserve,
@@ -171,7 +231,7 @@ async def chat_completions(
             request_id=request_id,
             tokens=estimate,
             provider=provider.name,
-            model=body.model,
+            model=route.public_id,
         )
     except quota.InsufficientQuotaError as exc:
         logger.info("Insufficient quota for application %s (key %s)", client.application_name, client.key_prefix)
@@ -191,22 +251,22 @@ async def chat_completions(
     except ProviderError as exc:
         await _settle(
             db, reservation, usage=exc.usage, succeeded=False,
-            may_have_consumed_tokens=exc.may_have_consumed_tokens, model=body.model, started=started,
+            may_have_consumed_tokens=exc.may_have_consumed_tokens, model=route.public_id, started=started,
         )
-        raise _provider_http_error(provider, exc)
+        raise _provider_http_error(route, exc) from exc
 
     # Transaction 2.
     await _settle(
         db, reservation, usage=response.usage, succeeded=True,
-        may_have_consumed_tokens=True, model=response.model, started=started,
+        may_have_consumed_tokens=True, model=route.public_id, started=started,
     )
-    return _to_http_response(response, request_id)
+    return _to_http_response(response, request_id, route.public_id)
 
 
 @router.get("/models", response_model=ModelList)
-async def list_models(provider: Provider = Depends(get_chat_provider)) -> ModelList:
-    try:
-        models = await provider.list_models()
-    except ProviderError as exc:
-        raise _provider_http_error(provider, exc)
-    return ModelList(data=[ModelObject(id=m.id, owned_by=m.owned_by) for m in models])
+async def list_models(registry: ModelRegistry = Depends(get_model_registry)) -> ModelList:
+    """The registered, enabled public models. Providers are not asked: this lists what the
+    gateway routes, not what each upstream happens to serve, so it works while they're down."""
+    return ModelList(
+        data=[ModelObject(id=route.public_id, owned_by=MODEL_OWNER) for route in registry.enabled_models()]
+    )

@@ -34,6 +34,8 @@ _TIMEOUT_STATUSES = {408, 504}
 
 
 class OpenAICompatibleProvider:
+    # Default instance name. Each configured instance (e.g. "groq", "ollama") gets its own name,
+    # which is what usage records store; the adapter type stays "openai_compatible".
     name = "openai_compatible"
 
     def __init__(
@@ -42,7 +44,10 @@ class OpenAICompatibleProvider:
         api_key: str | None = None,
         timeout_seconds: float = 60.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        name: str = "openai_compatible",
     ) -> None:
+        self.name = name
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
         # One client for the provider's lifetime, so connections are pooled and reused.
         self._client = httpx.AsyncClient(
@@ -51,6 +56,10 @@ class OpenAICompatibleProvider:
             timeout=timeout_seconds,
             transport=transport,
         )
+
+    def __repr__(self) -> str:
+        # Never include the base URL or the API key.
+        return f"OpenAICompatibleProvider(name={self.name!r})"
 
     async def aclose(self) -> None:
         await self._client.aclose()

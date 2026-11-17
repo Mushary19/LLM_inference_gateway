@@ -13,7 +13,6 @@ from sqlalchemy.exc import OperationalError
 
 from conftest import delete_committed_application
 
-from app.api.chat import get_chat_provider
 from app.core.config import settings
 from app.database.connection import SessionLocal
 from app.database.models import QuotaReservation, ReservationStatus, TokenQuota, UsageRecord, UsageStatus
@@ -28,6 +27,7 @@ from app.providers.base import (
     Usage,
 )
 from app.providers.fake import FAKE_MODEL
+from app.providers.registry import ModelRegistry, ModelRoute
 from app.services import quota as quota_service
 from app.services.api_keys import create_api_key, create_application
 from app.services.quota import MESSAGE_OVERHEAD_TOKENS, REQUEST_OVERHEAD_TOKENS, quota_inconsistencies
@@ -59,16 +59,6 @@ class ScriptedProvider:
 
     async def list_models(self):
         return [ModelInfo(id=FAKE_MODEL, owned_by="scripted")]
-
-
-@pytest.fixture
-def use_provider():
-    def install(provider):
-        app.dependency_overrides[get_chat_provider] = lambda: provider
-        return provider
-
-    yield install
-    app.dependency_overrides.pop(get_chat_provider, None)
 
 
 def set_limit(db, application_id, limit):
@@ -181,7 +171,8 @@ def test_keys_of_one_application_share_its_quota_over_http(client, db_session, a
 @pytest.mark.parametrize(
     "error, http_status, status, charged, usage_record",
     [
-        (ModelNotFoundError("gone"), 404, ReservationStatus.RELEASED, 0, None),
+        # Upstream "model not found" after routing is a 502 now; the settlement policy is unchanged.
+        (ModelNotFoundError("gone"), 502, ReservationStatus.RELEASED, 0, None),
         (ProviderUnavailableError("refused", may_have_consumed_tokens=False), 503, ReservationStatus.RELEASED, 0, None),
         (ProviderTimeoutError("read timeout"), 504, ReservationStatus.RECONCILED, ESTIMATE, (False, None)),
         (ProviderUnavailableError("dropped", usage=Usage(5, 3)), 503, ReservationStatus.RECONCILED, 8, (True, 8)),
@@ -196,7 +187,7 @@ def test_provider_failures_settle_by_policy(
 
     response = client.post(CHAT, json=BODY, headers=auth_headers)
 
-    assert response.status_code == http_status  # existing provider error mapping is unchanged
+    assert response.status_code == http_status
     [reservation] = reservations(db_session, app_id)
     assert (reservation.status, reservation.charged_tokens) == (status, charged)
     records = usage_rows(db_session, app_id)
@@ -529,3 +520,93 @@ def test_new_applications_get_the_default_quota(db_session):
     q = db_session.get(TokenQuota, application.id)
     assert (q.limit_tokens, q.consumed_tokens, q.reserved_tokens) == (settings.default_token_quota, 0, 0)
     assert db_session.scalar(select(func.count()).select_from(TokenQuota)) == 1
+
+
+# --- Model registry: what reservations and usage records store ---
+
+
+def routed_registry():
+    """Two provider instances; public IDs differ from what the providers call the models."""
+    groq, ollama = ScriptedProvider(), ScriptedProvider()
+    groq.name, ollama.name = "groq", "ollama"
+    registry = ModelRegistry(
+        {"groq": groq, "ollama": ollama},
+        [
+            ModelRoute("llama-3.3-70b", groq, "llama-3.3-70b-versatile"),
+            ModelRoute("qwen-local", ollama, "qwen2.5:7b"),
+        ],
+    )
+    return registry
+
+
+def test_usage_records_store_the_provider_instance_and_public_model(
+    client, db_session, api_key, auth_headers, use_registry
+):
+    use_registry(routed_registry())
+    app_id = api_key.record.application_id
+
+    response = client.post(CHAT, json={**BODY, "model": "llama-3.3-70b"}, headers=auth_headers)
+
+    # ScriptedProvider answers with the model it was sent: the upstream ID never reaches clients.
+    assert response.status_code == 200 and response.json()["model"] == "llama-3.3-70b"
+    [reservation] = reservations(db_session, app_id)
+    assert (reservation.provider, reservation.model) == ("groq", "llama-3.3-70b")
+    [record] = usage_rows(db_session, app_id)
+    assert (record.provider, record.model) == ("groq", "llama-3.3-70b")
+    listed = client.get("/v1/usage", headers=auth_headers).json()["data"]
+    assert [(r["provider"], r["model"]) for r in listed] == [("groq", "llama-3.3-70b")]
+
+
+def test_failed_requests_are_recorded_under_the_public_model_too(
+    client, db_session, api_key, auth_headers, use_registry
+):
+    registry = use_registry(routed_registry())
+    registry.resolve("qwen-local").provider.error = ProviderTimeoutError("read timeout")
+
+    assert client.post(CHAT, json={**BODY, "model": "qwen-local"}, headers=auth_headers).status_code == 504
+
+    [record] = usage_rows(db_session, api_key.record.application_id)
+    assert (record.provider, record.model, record.status) == ("ollama", "qwen-local", UsageStatus.FAILED)
+
+
+def test_usage_filters_by_public_model_and_provider_instance(client, db_session, api_key, auth_headers, use_registry):
+    use_registry(routed_registry())
+    for model in ("llama-3.3-70b", "llama-3.3-70b", "qwen-local"):
+        assert client.post(CHAT, json={**BODY, "model": model}, headers=auth_headers).status_code == 200
+
+    def requests(**params):
+        response = client.get("/v1/usage", headers=auth_headers, params=params)
+        assert response.status_code == 200, response.text
+        return response.json()["summary"]["requests"]
+
+    assert requests(model="llama-3.3-70b") == 2
+    assert requests(model="qwen-local") == 1
+    assert requests(provider="groq") == 2
+    assert requests(provider="ollama") == 1
+    assert requests(model="qwen-local", provider="groq") == 0
+    assert requests(model="llama-3.3-70b-versatile") == 0  # upstream IDs are never recorded
+
+
+def test_existing_usage_records_are_left_as_they_were(client, db_session, api_key, auth_headers, use_registry):
+    """Records from before the registry keep the adapter type and the upstream model name."""
+    app_id, key_id = api_key.record.application_id, api_key.record.id
+    legacy_id = record_usage(db_session, app_id, key_id, model="llama-3.3-70b-versatile", provider="openai_compatible")
+    db_session.expire_all()
+    before = db_session.scalar(select(UsageRecord).where(UsageRecord.request_id == legacy_id))
+    snapshot = {column.name: getattr(before, column.name) for column in UsageRecord.__table__.columns}
+    use_registry(routed_registry())
+
+    assert client.post(CHAT, json={**BODY, "model": "llama-3.3-70b"}, headers=auth_headers).status_code == 200
+
+    db_session.expire_all()
+    after = db_session.scalar(select(UsageRecord).where(UsageRecord.request_id == legacy_id))
+    assert {column.name: getattr(after, column.name) for column in UsageRecord.__table__.columns} == snapshot
+
+    def requests(**params):
+        return client.get("/v1/usage", headers=auth_headers, params=params).json()["summary"]["requests"]
+
+    # Filters match one naming convention at a time, as documented.
+    assert requests() == 2
+    assert requests(model="llama-3.3-70b") == 1
+    assert requests(provider="openai_compatible") == 1
+    assert requests(provider="groq") == 1

@@ -1,11 +1,12 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, SecretStr, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/.env, resolved from this file so it loads regardless of the working directory.
-ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+ENV_FILE = BACKEND_DIR / ".env"
 
 
 class Settings(BaseSettings):
@@ -43,14 +44,15 @@ class Settings(BaseSettings):
     # Simultaneous model.generate() calls in the Hugging Face engine.
     inference_max_concurrency: int = Field(default=1, gt=0)
 
-    # Provider behind the gateway endpoint POST /v1/chat/completions.
-    # "openai_compatible" talks to any OpenAI-style /chat/completions API (Ollama, vLLM, ...).
-    chat_provider: Literal["fake", "openai_compatible"] = "fake"
-    openai_compatible_base_url: str = "http://localhost:11434/v1"  # local Ollama
-    # Optional bearer token. Ollama ignores it; hosted APIs require it.
-    openai_compatible_api_key: SecretStr | None = None
-    # Covers the whole request including generation, which is slow on CPU.
-    openai_compatible_timeout_seconds: float = Field(default=120.0, gt=0)
+    # Model registry behind POST /v1/chat/completions and GET /v1/models: a JSON file mapping
+    # public model IDs to provider instances (see models.example.json). A relative path is
+    # resolved against the backend directory (where .env lives), not the working directory.
+    # Unset: a built-in registry with only the fake provider and its model "fake-model".
+    model_registry_file: Path | None = None
+
+    # Legacy, replaced by model_registry_file. Kept only so a deployment still configured with
+    # CHAT_PROVIDER=openai_compatible fails at startup instead of silently serving fake output.
+    chat_provider: str = "fake"
 
     # Per-API-key rate limiting (token bucket in Redis). The default URL is the docker-compose
     # "redis" service as seen from the host-run backend; inside Compose use redis://redis:6379/0.
@@ -63,6 +65,19 @@ class Settings(BaseSettings):
     # Token quota given to applications created without an explicit --token-limit.
     # A quota is a lifetime allowance: it never resets automatically.
     default_token_quota: int = Field(default=1_000_000, ge=0)
+
+    @field_validator("model_registry_file", mode="before")
+    @classmethod
+    def _empty_registry_file_is_unset(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("model_registry_file")
+    @classmethod
+    def _resolve_registry_file(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        value = value.expanduser()
+        return value if value.is_absolute() else BACKEND_DIR / value
 
     @model_validator(mode="after")
     def _check_gpu_memory(self) -> "Settings":

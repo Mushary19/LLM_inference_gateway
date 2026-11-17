@@ -1,0 +1,33 @@
+{
+  "providers": {
+    "groq": {
+      "type": "openai_compatible",
+      "base_url": "https://api.groq.com/openai/v1",
+      "api_key_env": "GROQ_API_KEY",
+      "timeout_seconds": 60
+    },
+    "ollama": {
+      "type": "openai_compatible",
+      "base_url": "http://localhost:11434/v1",
+      "timeout_seconds": 120
+    },
+    "fake": {
+      "type": "fake"
+    }
+  },
+  "models": {
+    "llama-3.3-70b": {
+      "provider": "groq",
+      "provider_model_id": "llama-3.3-70b-versatile"
+    },
+    "qwen-local": {
+      "provider": "ollama",
+      "provider_model_id": "qwen2.5:7b",
+      "enabled": false
+    },
+    "fake-model": {
+      "provider": "fake",
+      "provider_model_id": "fake-model"
+    }
+  }
+}

@@ -12,7 +12,6 @@ from fastapi.testclient import TestClient
 from conftest import delete_committed_application
 
 from app.api.auth import AuthenticatedClient, require_api_key
-from app.api.chat import get_chat_provider
 from app.database.connection import SessionLocal, engine
 from app.main import app
 from app.providers.base import ChatMessage, ChatResponse, ModelInfo, ProviderUnavailableError, Usage
@@ -57,11 +56,8 @@ class CountingProvider:
 
 
 @pytest.fixture
-def provider():
-    counting = CountingProvider()
-    app.dependency_overrides[get_chat_provider] = lambda: counting
-    yield counting
-    app.dependency_overrides.pop(get_chat_provider, None)
+def provider(use_provider):
+    return use_provider(CountingProvider())
 
 
 def send(client, endpoint, headers=None, json=CHAT_BODY):
@@ -162,9 +158,9 @@ def test_valid_key_reaches_list_models(client, provider, auth_headers):
     assert response.status_code == 200
     assert response.json() == {
         "object": "list",
-        "data": [{"id": FAKE_MODEL, "object": "model", "created": 0, "owned_by": "fake"}],
+        "data": [{"id": FAKE_MODEL, "object": "model", "created": 0, "owned_by": "inferenceflow"}],
     }
-    assert provider.calls == ["list_models"]
+    assert provider.calls == []  # the listing comes from the registry
 
 
 def test_bearer_scheme_is_case_insensitive(client, provider, api_key):
@@ -173,16 +169,14 @@ def test_bearer_scheme_is_case_insensitive(client, provider, api_key):
     assert response.status_code == 200
 
 
-def test_list_models_maps_provider_errors(client, auth_headers):
-    app.dependency_overrides[get_chat_provider] = lambda: CountingProvider(
-        list_models_error=ProviderUnavailableError("upstream down")
-    )
-    try:
-        response = send(client, MODELS, auth_headers)
-    finally:
-        app.dependency_overrides.pop(get_chat_provider, None)
+def test_list_models_works_while_the_provider_is_down(client, auth_headers, use_provider):
+    down = use_provider(CountingProvider(list_models_error=ProviderUnavailableError("upstream down")))
 
-    assert response.status_code == 503 and response.json() == {"detail": "upstream down"}
+    response = send(client, MODELS, auth_headers)
+
+    assert response.status_code == 200
+    assert [m["id"] for m in response.json()["data"]] == [FAKE_MODEL]
+    assert down.calls == []
 
 
 # --- Authenticated client reaches the route; keys never logged ---
@@ -292,20 +286,18 @@ class PoolObservingProvider:
 
 
 @pytest.mark.parametrize("endpoint", PROTECTED, ids=["chat", "models"])
-def test_connection_is_returned_to_the_pool_before_the_provider_call(committed_key, endpoint):
-    provider = PoolObservingProvider()
-    app.dependency_overrides[get_chat_provider] = lambda: provider
-    try:
-        with TestClient(app) as client:
-            assert engine.pool.checkedout() == 0
-            response = send(client, endpoint, {"Authorization": f"Bearer {committed_key}"})
-    finally:
-        app.dependency_overrides.pop(get_chat_provider, None)
+def test_connection_is_returned_to_the_pool_before_the_provider_call(committed_key, endpoint, use_provider):
+    provider = use_provider(PoolObservingProvider())
+    with TestClient(app) as client:
+        assert engine.pool.checkedout() == 0
+        response = send(client, endpoint, {"Authorization": f"Bearer {committed_key}"})
+        # Nothing is held after the request either (GET /v1/models never calls the provider).
+        assert engine.pool.checkedout() == 0
 
     assert response.status_code == 200
     # While the provider was running: no pooled connection checked out, and no session left
     # idle in the authentication's read transaction.
-    assert provider.observations == [(0, 0)]
+    assert provider.observations == ([(0, 0)] if endpoint == CHAT else [])
 
 
 def test_authenticated_client_does_not_depend_on_the_session(committed_key):

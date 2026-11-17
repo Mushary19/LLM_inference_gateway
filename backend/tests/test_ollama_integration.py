@@ -9,6 +9,7 @@ OLLAMA_BASE_URL overrides the default http://localhost:11434/v1.
 """
 
 import asyncio
+import json
 import os
 
 import pytest
@@ -59,22 +60,28 @@ def test_provider_against_real_ollama():
     assert response.finish_reason in ("stop", "length")
 
 
-def test_chat_completions_endpoint_against_real_ollama(monkeypatch, db_session, auth_headers):
-    monkeypatch.setattr(settings, "chat_provider", "openai_compatible")
-    monkeypatch.setattr(settings, "openai_compatible_base_url", BASE_URL)
-    monkeypatch.setattr(settings, "openai_compatible_timeout_seconds", 300)
+def test_chat_completions_endpoint_against_real_ollama(monkeypatch, tmp_path, db_session, auth_headers):
+    registry_file = tmp_path / "models.json"
+    registry_file.write_text(json.dumps({
+        "providers": {"ollama": {"type": "openai_compatible", "base_url": BASE_URL, "timeout_seconds": 300}},
+        "models": {"ollama-integration": {"provider": "ollama", "provider_model_id": MODEL}},
+    }))
+    monkeypatch.setattr(settings, "model_registry_file", registry_file)
     app.dependency_overrides[get_db] = lambda: db_session
 
     try:
         with TestClient(app, headers=auth_headers) as client:
+            models = client.get("/v1/models").json()
             response = client.post(
                 "/v1/chat/completions",
-                json={"model": MODEL, "messages": [{"role": "user", "content": "Say hi"}], "max_tokens": 10},
+                json={"model": "ollama-integration", "messages": [{"role": "user", "content": "Say hi"}], "max_tokens": 10},
             )
     finally:
         app.dependency_overrides.pop(get_db, None)
 
+    assert [m["id"] for m in models["data"]] == ["ollama-integration"]
     assert response.status_code == 200, response.text
     body = response.json()
+    assert body["model"] == "ollama-integration"
     assert body["choices"][0]["message"]["content"].strip()
     assert body["usage"]["total_tokens"] > 0

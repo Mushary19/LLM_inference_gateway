@@ -2,12 +2,12 @@
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import httpx2 as httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app.api.chat import get_chat_provider
 from app.core.config import settings
 from app.database.connection import get_db
 from app.main import app
@@ -24,6 +24,7 @@ from app.providers.base import (
 )
 from app.providers.factory import create_provider
 from app.providers.fake import FakeProvider
+from app.providers.registry import FakeProviderConfig, OpenAICompatibleProviderConfig
 from app.providers.openai_compatible import OpenAICompatibleProvider
 
 BASE_URL = "http://localhost:11434/v1"
@@ -62,8 +63,8 @@ class Upstream:
         return self.response
 
 
-def make_provider(upstream: Upstream, api_key: str | None = None) -> OpenAICompatibleProvider:
-    return OpenAICompatibleProvider(BASE_URL, api_key=api_key, transport=httpx.MockTransport(upstream))
+def make_provider(upstream: Upstream, api_key: str | None = None, name: str = "openai_compatible") -> OpenAICompatibleProvider:
+    return OpenAICompatibleProvider(BASE_URL, api_key=api_key, transport=httpx.MockTransport(upstream), name=name)
 
 
 def chat_request(**overrides) -> ChatRequest:
@@ -342,45 +343,72 @@ def test_stream_is_not_implemented_yet():
 # --- Factory and application wiring ---
 
 
-def test_factory_builds_each_provider():
-    fake = create_provider("fake")
-    real = create_provider("openai_compatible", base_url=BASE_URL, api_key="k", timeout_seconds=5)
+def test_factory_builds_each_provider_from_its_configuration():
+    fake = create_provider("local-fake", FakeProviderConfig(type="fake"))
+    config = OpenAICompatibleProviderConfig(type="openai_compatible", base_url=BASE_URL, timeout_seconds=5)
+    real = create_provider("groq", config, api_key="k")
 
-    assert isinstance(fake, FakeProvider)
-    assert isinstance(real, OpenAICompatibleProvider)
+    assert isinstance(fake, FakeProvider) and fake.name == "local-fake"
+    assert isinstance(real, OpenAICompatibleProvider) and real.name == "groq"
     assert real._client.base_url == httpx.URL(f"{BASE_URL}/")
     assert real._client.timeout == httpx.Timeout(5)
+    assert real._client.headers["Authorization"] == "Bearer k"
     run(real.aclose())
 
 
-@pytest.mark.parametrize("name, kwargs", [("openai_compatible", {}), ("nope", {"base_url": BASE_URL})])
-def test_factory_rejects_bad_configuration(name, kwargs):
-    with pytest.raises(ValueError):
-        create_provider(name, **kwargs)
+def test_factory_without_api_key_sends_no_authorization():
+    config = OpenAICompatibleProviderConfig(type="openai_compatible", base_url=BASE_URL)
+    provider = create_provider("ollama", config)
+
+    assert "Authorization" not in provider._client.headers
+    assert provider._client.timeout == httpx.Timeout(60)  # the configuration default
+    run(provider.aclose())
 
 
-def test_app_creates_and_closes_the_configured_provider(monkeypatch):
-    monkeypatch.setattr(settings, "chat_provider", "openai_compatible")
+def test_factory_rejects_an_unknown_type():
+    with pytest.raises(ValueError, match="unknown provider type"):
+        create_provider("x", SimpleNamespace(type="nope"))
+
+
+def test_provider_names_default_to_the_adapter_type():
+    assert OpenAICompatibleProvider(BASE_URL).name == "openai_compatible"
+    assert FakeProvider().name == "fake"
+    assert OpenAICompatibleProvider.name == "openai_compatible" and FakeProvider.name == "fake"
+
+
+def test_provider_repr_hides_the_url_and_the_key():
+    provider = OpenAICompatibleProvider("https://api.internal.example/v1", api_key="sk-secret-value", name="groq")
+
+    assert repr(provider) == "OpenAICompatibleProvider(name='groq')"
+    run(provider.aclose())
+
+
+def test_app_creates_and_closes_the_registry_providers(monkeypatch, tmp_path):
+    registry_file = tmp_path / "models.json"
+    registry_file.write_text(json.dumps({
+        "providers": {"local": {"type": "openai_compatible", "base_url": BASE_URL}},
+        "models": {"qwen-small": {"provider": "local", "provider_model_id": MODEL}},
+    }))
+    monkeypatch.setattr(settings, "model_registry_file", registry_file)
 
     with TestClient(app):
-        provider = app.state.chat_provider
-        assert isinstance(provider, OpenAICompatibleProvider)
+        provider = app.state.model_registry.resolve("qwen-small").provider
+        assert isinstance(provider, OpenAICompatibleProvider) and provider.name == "local"
         assert not provider._client.is_closed
 
     assert provider._client.is_closed
 
 
 @pytest.fixture
-def client_with_upstream(db_session, auth_headers):
+def client_with_upstream(db_session, auth_headers, use_provider):
     """The real app (authenticated) with an OpenAICompatibleProvider talking to a mock upstream."""
 
-    def build(upstream: Upstream) -> TestClient:
-        app.dependency_overrides[get_chat_provider] = lambda: make_provider(upstream)
+    def build(upstream: Upstream, *, api_key: str | None = None, models=(MODEL,)) -> TestClient:
+        use_provider(make_provider(upstream, api_key=api_key, name="groq"), models=models)
         app.dependency_overrides[get_db] = lambda: db_session
         return TestClient(app, headers=auth_headers)
 
     yield build
-    app.dependency_overrides.pop(get_chat_provider, None)
     app.dependency_overrides.pop(get_db, None)
 
 
@@ -408,7 +436,7 @@ def test_endpoint_returns_the_upstream_completion(client_with_upstream):
     [
         (Upstream(raises=httpx.ConnectError("Connection refused")), 503),
         (Upstream(raises=httpx.ReadTimeout("timed out")), 504),
-        (Upstream(httpx.Response(404, json={"error": {"message": 'model "x" not found'}})), 404),
+        (Upstream(httpx.Response(404, json={"error": {"message": 'model "x" not found'}})), 502),
         (Upstream(httpx.Response(200, text="garbage")), 502),
     ],
 )
@@ -472,3 +500,61 @@ def test_malformed_usage_is_rejected_rather_than_guessed(usage):
 
     with pytest.raises(ProviderError):
         run(chat_once(make_provider(upstream), chat_request()))
+
+
+# --- Nothing upstream-specific reaches the client ---
+
+SECRET = "sk-test-secret-0123456789"
+PUBLIC = "llama-3.3-70b"
+UPSTREAM_ID = "llama-3.3-70b-versatile"
+
+
+def test_routed_request_uses_the_upstream_model_id_and_the_key(client_with_upstream):
+    upstream = Upstream(httpx.Response(200, json=completion(model=UPSTREAM_ID)))
+
+    with client_with_upstream(upstream, api_key=SECRET, models={PUBLIC: UPSTREAM_ID}) as client:
+        response = client.post(URL, json={**BODY, "model": PUBLIC})
+
+    assert response.status_code == 200 and response.json()["model"] == PUBLIC
+    [sent] = upstream.requests
+    assert json.loads(sent.content)["model"] == UPSTREAM_ID
+    assert sent.headers["Authorization"] == f"Bearer {SECRET}"
+    assert UPSTREAM_ID not in response.text and SECRET not in response.text
+
+
+@pytest.mark.parametrize(
+    "upstream, status",
+    [
+        (Upstream(raises=httpx.ConnectError(f"[Errno 111] connecting to {BASE_URL}")), 503),
+        (Upstream(raises=httpx.ReadTimeout(f"timed out reading {BASE_URL}")), 504),
+        (Upstream(httpx.Response(500, json={"error": {"message": f"crash serving {UPSTREAM_ID} on 10.0.3.7"}})), 502),
+        (Upstream(httpx.Response(401, json={"error": {"message": "Invalid API key provided"}})), 502),
+        (Upstream(httpx.Response(404, json={"error": {"message": f"The model {UPSTREAM_ID} does not exist"}})), 502),
+        (Upstream(httpx.Response(429, json={"error": {"message": f"Rate limit reached for {UPSTREAM_ID}"}})), 503),
+        (Upstream(httpx.Response(200, text=f"<html>{BASE_URL} proxy error</html>")), 502),
+    ],
+    ids=["connect", "timeout", "500", "401", "404", "429", "garbage"],
+)
+def test_upstream_failures_leak_nothing(client_with_upstream, upstream, status, caplog):
+    with client_with_upstream(upstream, api_key=SECRET, models={PUBLIC: UPSTREAM_ID}) as client:
+        response = client.post(URL, json={**BODY, "model": PUBLIC})
+
+    assert response.status_code == status
+    for leaked in (SECRET, UPSTREAM_ID, "localhost", "11434", "10.0.3.7", "groq", "API key", "html"):
+        assert leaked not in response.text
+    assert SECRET not in caplog.text  # details are logged, credentials never
+
+
+def test_upstream_400_keeps_a_useful_sanitized_message(client_with_upstream, caplog):
+    message = f"Model {UPSTREAM_ID} context window is 8192 tokens; see {BASE_URL}/docs"
+    upstream = Upstream(httpx.Response(400, json={"error": {"message": message}}))
+
+    with client_with_upstream(upstream, api_key=SECRET, models={PUBLIC: UPSTREAM_ID}) as client:
+        response = client.post(URL, json={**BODY, "model": PUBLIC})
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": f"The provider rejected the request: Model {PUBLIC} context window is 8192 tokens; see [redacted]"
+    }
+    assert UPSTREAM_ID in caplog.text  # the server log keeps the original
+    assert SECRET not in caplog.text

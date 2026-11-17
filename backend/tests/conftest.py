@@ -1,6 +1,6 @@
 import os
 import sys
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from pathlib import Path
 from typing import NamedTuple
 
@@ -44,11 +44,15 @@ from sqlalchemy import create_engine, delete, select, text  # noqa: E402
 from sqlalchemy.exc import OperationalError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
+from app.api.chat import get_model_registry  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.database.base import Base  # noqa: E402
 from app.database.connection import engine, get_db  # noqa: E402
 from app.database.models import ApiKey, ClientApplication, QuotaReservation, UsageRecord  # noqa: E402
 from app.main import app  # noqa: E402
+from app.providers.fake import FAKE_MODEL  # noqa: E402
+from app.providers import registry as registry_module  # noqa: E402
+from app.providers.registry import ModelRegistry, ModelRoute  # noqa: E402
 from app.services.api_keys import create_api_key, create_application  # noqa: E402
 
 if (engine.url.database, engine.url.port) != (TEST_DATABASE.database, TEST_DATABASE.port):
@@ -143,11 +147,48 @@ def simulated_inference_engine(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def fake_chat_provider(monkeypatch):
-    """Never call a real provider (or send a real API key) from tests, whatever .env configures."""
+def default_model_registry(monkeypatch):
+    """Never load a registry file, call a real provider or read a real API key from tests,
+    whatever .env configures: every app started by a test uses the built-in fake registry
+    unless the test injects its own (see use_provider)."""
+    monkeypatch.setattr(settings, "model_registry_file", None)
     monkeypatch.setattr(settings, "chat_provider", "fake")
-    monkeypatch.setattr(settings, "openai_compatible_base_url", "http://localhost:11434/v1")
-    monkeypatch.setattr(settings, "openai_compatible_api_key", None)
+    # A test that does load a registry file sees no API key variables from .env or the shell.
+    monkeypatch.setattr(registry_module, "_process_environment", lambda: {})
+
+
+def registry_with(provider, models=(FAKE_MODEL,)) -> ModelRegistry:
+    """A registry routing public model IDs to one provider instance.
+
+    `models` is either public IDs (each routed upstream under the same ID) or a mapping of
+    public ID -> provider model ID.
+    """
+    pairs = models.items() if isinstance(models, Mapping) else [(model, model) for model in models]
+    name = getattr(provider, "name", "test")
+    return ModelRegistry({name: provider}, [ModelRoute(public, provider, upstream) for public, upstream in pairs])
+
+
+@pytest.fixture
+def use_registry():
+    """Inject a model registry through FastAPI's dependency overrides."""
+
+    def install(registry: ModelRegistry) -> ModelRegistry:
+        app.dependency_overrides[get_model_registry] = lambda: registry
+        return registry
+
+    yield install
+    app.dependency_overrides.pop(get_model_registry, None)
+
+
+@pytest.fixture
+def use_provider(use_registry):
+    """Inject a single provider (see registry_with) serving FAKE_MODEL, or the given models."""
+
+    def install(provider, models=(FAKE_MODEL,)):
+        use_registry(registry_with(provider, models))
+        return provider
+
+    return install
 
 
 @pytest.fixture

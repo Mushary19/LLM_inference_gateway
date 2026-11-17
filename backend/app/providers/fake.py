@@ -30,17 +30,23 @@ class FakeProvider:
     reply to that many words and reports finish_reason="length".
     """
 
-    name = "fake"
+    name = "fake"  # default instance name; the adapter type is also "fake"
 
     def __init__(
         self,
         models: tuple[str, ...] = (FAKE_MODEL,),
         delay_seconds: float = 0.0,
         fail_with: ProviderError | None = None,
+        *,
+        name: str = "fake",
     ) -> None:
+        self.name = name
         self.models = models
         self.delay_seconds = delay_seconds
         self.fail_with = fail_with
+
+    def __repr__(self) -> str:
+        return f"FakeProvider(name={self.name!r})"
 
     async def chat(self, request: ChatRequest) -> ChatResponse:
         words, finish_reason = await self._complete(request)

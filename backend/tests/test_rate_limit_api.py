@@ -18,7 +18,7 @@ from sqlalchemy import event
 
 from conftest import delete_committed_application
 
-from app.api.chat import get_chat_provider, router as v1_router
+from app.api.chat import router as v1_router
 from app.api.rate_limit import get_rate_limiter
 from app.core.config import settings
 from app.database.connection import SessionLocal, engine, get_db
@@ -79,11 +79,8 @@ class SpyLimiter:
 
 
 @pytest.fixture
-def provider():
-    counting = CountingProvider()
-    app.dependency_overrides[get_chat_provider] = lambda: counting
-    yield counting
-    app.dependency_overrides.pop(get_chat_provider, None)
+def provider(use_provider):
+    return use_provider(CountingProvider())
 
 
 @pytest.fixture
@@ -210,7 +207,7 @@ def test_exceeding_the_limit_returns_429_without_calling_the_provider(client, pr
     assert rejected.headers["X-RateLimit-Limit"] == "2"
     assert rejected.headers["X-RateLimit-Remaining"] == "0"
     assert rejected.headers["X-RateLimit-Reset"] == "4"
-    assert len(provider.calls) == 2 and len(spy.calls) == 4
+    assert len(provider.calls) == (2 if endpoint == CHAT else 0) and len(spy.calls) == 4
 
 
 def test_keys_have_independent_buckets(client, provider, limiter, db_session, auth_headers):
@@ -262,17 +259,16 @@ def test_concurrent_http_requests_admit_exactly_the_burst(provider, limiter, com
             t.join()
 
     assert sorted(results) == [200] * 5 + [429] * 15
-    assert provider.calls == ["list_models"] * 5
+    assert provider.calls == []  # the model listing comes from the registry, not the provider
 
 
-def test_provider_errors_keep_their_mapping(client, spy, auth_headers):
-    app.dependency_overrides[get_chat_provider] = lambda: FakeProvider(fail_with=ProviderUnavailableError("upstream down"))
-    try:
-        response = send(client, CHAT, auth_headers)
-    finally:
-        app.dependency_overrides.pop(get_chat_provider, None)
+def test_provider_errors_keep_their_mapping(client, spy, auth_headers, use_provider):
+    use_provider(FakeProvider(fail_with=ProviderUnavailableError("upstream down")))
 
-    assert response.status_code == 503 and response.json() == {"detail": "upstream down"}
+    response = send(client, CHAT, auth_headers)
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "The provider is temporarily unavailable."}
     assert len(spy.calls) == 1  # the request was admitted, then the provider failed
 
 
@@ -428,12 +424,19 @@ def test_one_redis_client_is_reused_and_closed_on_shutdown(db_session, auth_head
 def test_shutdown_survives_a_failing_redis_close(monkeypatch, caplog):
     with TestClient(app):
         limiter = app.state.rate_limiter
-        provider = app.state.chat_provider
+        registry = app.state.model_registry
+        registry_closed = []
+        close_registry = registry.aclose
 
         async def broken_aclose():
             raise ConnectionError("close failed")
 
+        async def recording_registry_aclose():
+            registry_closed.append(True)
+            await close_registry()
+
         monkeypatch.setattr(limiter, "aclose", broken_aclose)
-        monkeypatch.setattr(provider, "aclose", provider.aclose)
+        monkeypatch.setattr(registry, "aclose", recording_registry_aclose)
 
     assert "Failed to close the Redis rate-limit client" in caplog.text
+    assert registry_closed == [True]  # the providers are still closed
