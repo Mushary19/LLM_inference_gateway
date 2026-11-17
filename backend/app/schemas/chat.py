@@ -74,4 +74,5 @@ class ChatCompletionResponse(BaseModel):
     created: int
     model: str
     choices: list[ChatChoice]
-    usage: ChatUsage
+    # null when the provider didn't report token usage.
+    usage: ChatUsage | None

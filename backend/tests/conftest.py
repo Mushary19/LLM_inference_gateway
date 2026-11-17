@@ -40,14 +40,14 @@ import redis  # noqa: E402
 from alembic import command  # noqa: E402
 from alembic.config import Config  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from sqlalchemy import create_engine, text  # noqa: E402
+from sqlalchemy import create_engine, delete, select, text  # noqa: E402
 from sqlalchemy.exc import OperationalError  # noqa: E402
 from sqlalchemy.orm import Session  # noqa: E402
 
 from app.core.config import settings  # noqa: E402
 from app.database.base import Base  # noqa: E402
 from app.database.connection import engine, get_db  # noqa: E402
-from app.database.models import ApiKey  # noqa: E402
+from app.database.models import ApiKey, ClientApplication, QuotaReservation, UsageRecord  # noqa: E402
 from app.main import app  # noqa: E402
 from app.services.api_keys import create_api_key, create_application  # noqa: E402
 
@@ -170,6 +170,22 @@ def db_session() -> Generator[Session, None, None]:
         session.close()
         transaction.rollback()
         connection.close()
+
+
+def delete_committed_application(db: Session, name: str) -> None:
+    """Remove an application committed by a test, with everything that references it.
+
+    Its token quota goes with it (ON DELETE CASCADE); usage records, reservations and keys
+    don't cascade (they're the audit trail), so they're deleted first, in dependency order.
+    """
+    application_id = db.scalar(select(ClientApplication.id).where(ClientApplication.name == name))
+    if application_id is None:
+        return
+    db.execute(delete(UsageRecord).where(UsageRecord.application_id == application_id))
+    db.execute(delete(QuotaReservation).where(QuotaReservation.application_id == application_id))
+    db.execute(delete(ApiKey).where(ApiKey.application_id == application_id))
+    db.execute(delete(ClientApplication).where(ClientApplication.id == application_id))
+    db.commit()
 
 
 class IssuedKey(NamedTuple):

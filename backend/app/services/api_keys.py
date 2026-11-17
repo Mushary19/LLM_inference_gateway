@@ -20,7 +20,8 @@ from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from app.database.models import ApiKey, ClientApplication
+from app.core.config import settings
+from app.database.models import ApiKey, ClientApplication, TokenQuota
 
 KEY_PREFIX = "if_"
 PUBLIC_ID_LENGTH = 8
@@ -53,9 +54,19 @@ def looks_like_api_key(candidate: str) -> bool:
     return API_KEY_PATTERN.fullmatch(candidate) is not None
 
 
-def create_application(session: Session, name: str) -> ClientApplication:
+def create_application(session: Session, name: str, token_limit: int | None = None) -> ClientApplication:
+    """Create an application together with its token quota (DEFAULT_TOKEN_QUOTA if not given)."""
+    if token_limit is not None and token_limit < 0:
+        raise ValueError("token_limit must be >= 0")
     application = ClientApplication(name=name.strip())
     session.add(application)
+    session.flush()
+    session.add(
+        TokenQuota(
+            application_id=application.id,
+            limit_tokens=settings.default_token_quota if token_limit is None else token_limit,
+        )
+    )
     session.flush()
     return application
 

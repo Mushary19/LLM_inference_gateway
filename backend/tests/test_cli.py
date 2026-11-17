@@ -169,3 +169,114 @@ def test_help_lists_the_commands(capsys):
     assert exit_info.value.code == 0
     out = capsys.readouterr().out
     assert all(command in out for command in ("create-app", "create-key", "list-keys", "revoke-key"))
+
+
+# --- quota commands ---
+
+
+def test_create_app_gets_the_default_or_given_token_quota(run, db_session):
+    from app.core.config import settings
+    from app.database.models import TokenQuota
+
+    _, default_out, _ = run("create-app", "defaulted")
+    _, custom_out, _ = run("create-app", "custom", "--token-limit", "5000")
+
+    limits = {
+        name: db_session.scalar(select(TokenQuota.limit_tokens).join(ClientApplication).where(ClientApplication.name == name))
+        for name in ("defaulted", "custom")
+    }
+    assert limits == {"defaulted": settings.default_token_quota, "custom": 5000}
+    assert f"quota of {settings.default_token_quota} tokens" in default_out
+    assert "quota of 5000 tokens" in custom_out
+    code, _, err = run("create-app", "negative", "--token-limit", "-1")
+    assert code == 1 and "must be >= 0" in err
+
+
+def test_set_and_show_quota(run):
+    run("create-app", "mobile-app", "--token-limit", "100")
+
+    code, out, _ = run("set-quota", "--app", "mobile-app", "--limit", "2500")
+    assert code == 0 and "set to 2500 tokens" in out
+
+    code, out, _ = run("show-quota", "--app", "mobile-app")
+    assert code == 0
+    assert out.strip() == "limit=2500 consumed=0 reserved=0 available=2500"
+
+
+def test_quota_commands_reject_bad_input(run):
+    run("create-app", "mobile-app")
+
+    assert run("set-quota", "--app", "nope", "--limit", "5")[0] == 1
+    assert run("set-quota", "--app", "mobile-app", "--limit", "-5")[0] == 1
+    assert run("show-quota", "--app", "nope")[0] == 1
+    assert run("expire-reservations", "--older-than-minutes", "0")[0] == 1
+
+
+def test_expire_reservations_settles_only_stale_reservations(run, db_session):
+    import uuid as uuid_module
+    from datetime import timedelta
+
+    from sqlalchemy import func, update
+
+    from app.database.models import QuotaReservation, ReservationStatus
+    from app.services import quota
+
+    run("create-app", "mobile-app", "--token-limit", "1000")
+    run("create-key", "--app", "mobile-app", "--name", "production")
+    key = db_session.scalar(select(ApiKey))
+    stale, fresh = (
+        quota.reserve(db_session, application_id=key.application_id, api_key_id=key.id,
+                      request_id=uuid_module.uuid4(), tokens=100, provider="fake", model="m")
+        for _ in range(2)
+    )
+    db_session.execute(
+        update(QuotaReservation).where(QuotaReservation.id == stale.reservation_id)
+        .values(created_at=func.now() - timedelta(minutes=90))
+    )
+    db_session.commit()
+
+    code, out, _ = run("expire-reservations", "--older-than-minutes", "60")
+
+    assert code == 0
+    assert "Expired 1 reservation(s)" in out and f"chatcmpl-{stale.request_id.hex}" in out
+    db_session.expire_all()
+    assert db_session.get(QuotaReservation, stale.reservation_id).status is ReservationStatus.EXPIRED
+    assert db_session.get(QuotaReservation, fresh.reservation_id).status is ReservationStatus.RESERVED
+    assert run("show-quota", "--app", "mobile-app")[1].strip() == "limit=1000 consumed=100 reserved=100 available=800"
+    assert "Expired 0 reservation(s)" in run("expire-reservations")[1]
+
+
+def test_set_quota_restores_a_deleted_quota_from_its_reservations(run, db_session):
+    """The quota row is deleted while reservations exist; set-quota recreates it."""
+    import uuid as uuid_module
+
+    from sqlalchemy import text
+
+    from app.database.models import TokenQuota
+    from app.providers.base import Usage
+    from app.services import quota
+
+    run("create-app", "mobile-app", "--token-limit", "100000")
+    run("create-key", "--app", "mobile-app", "--name", "production")
+    key = db_session.scalar(select(ApiKey))
+
+    def reserve(tokens):
+        return quota.reserve(db_session, application_id=key.application_id, api_key_id=key.id,
+                             request_id=uuid_module.uuid4(), tokens=tokens, provider="fake", model="m")
+
+    settled = reserve(500)
+    quota.settle(db_session, settled.reservation_id, usage=Usage(40, 60), succeeded=True, may_have_consumed_tokens=True)
+    outstanding = reserve(2000)
+    db_session.execute(text("DELETE FROM token_quotas WHERE application_id = :id"), {"id": key.application_id})
+    db_session.commit()
+
+    code, out, _ = run("set-quota", "--app", "mobile-app", "--limit", "100000")
+
+    assert code == 0
+    # Rebuilt from the reservation history, not reset to zero.
+    assert "limit=100000 consumed=100 reserved=2000 available=97900" in out
+    quota.settle(db_session, outstanding.reservation_id, usage=Usage(300, 200), succeeded=True, may_have_consumed_tokens=True)
+    db_session.expire_all()
+    restored = db_session.get(TokenQuota, key.application_id)
+    assert (restored.consumed_tokens, restored.reserved_tokens) == (600, 0)
+    assert quota.quota_inconsistencies(db_session, key.application_id) == []

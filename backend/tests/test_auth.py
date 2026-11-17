@@ -8,12 +8,12 @@ import psycopg
 import pytest
 from fastapi.security import HTTPAuthorizationCredentials
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, select
+
+from conftest import delete_committed_application
 
 from app.api.auth import AuthenticatedClient, require_api_key
 from app.api.chat import get_chat_provider
 from app.database.connection import SessionLocal, engine
-from app.database.models import ApiKey, ClientApplication
 from app.main import app
 from app.providers.base import ChatMessage, ChatResponse, ModelInfo, ProviderUnavailableError, Usage
 from app.providers.fake import FAKE_MODEL
@@ -256,12 +256,7 @@ def committed_key():
         yield plaintext
     finally:
         with SessionLocal() as db:
-            application_id = db.scalar(
-                select(ClientApplication.id).where(ClientApplication.name == application_name)
-            )
-            db.execute(delete(ApiKey).where(ApiKey.application_id == application_id))
-            db.execute(delete(ClientApplication).where(ClientApplication.id == application_id))
-            db.commit()
+            delete_committed_application(db, application_name)
 
 
 def _idle_in_transaction_backends() -> int:

@@ -149,10 +149,10 @@ def test_finish_reason_is_normalized(upstream_reason, expected):
     assert run(chat_once(make_provider(upstream), chat_request())).finish_reason == expected
 
 
-def test_missing_usage_is_reported_as_zero_tokens():
+def test_missing_usage_is_reported_as_unknown_not_zero():
     upstream = Upstream(httpx.Response(200, json=completion(usage=False)))
 
-    assert run(chat_once(make_provider(upstream), chat_request())).usage == Usage(0, 0)
+    assert run(chat_once(make_provider(upstream), chat_request())).usage is None
 
 
 def test_missing_model_in_response_falls_back_to_requested_model():
@@ -418,3 +418,57 @@ def test_endpoint_maps_upstream_failures(client_with_upstream, upstream, status)
 
     assert response.status_code == status
     assert "detail" in response.json()
+
+
+# --- Whether a failure may have consumed tokens (used by quota accounting) ---
+
+
+@pytest.mark.parametrize(
+    "exception, expected_type, may_have_consumed",
+    [
+        (httpx.ConnectError("Connection refused"), ProviderUnavailableError, False),
+        (httpx.ConnectTimeout("connect timed out"), ProviderTimeoutError, False),
+        (httpx.PoolTimeout("no free connection"), ProviderTimeoutError, False),
+        (httpx.ReadTimeout("read timed out"), ProviderTimeoutError, True),
+        (httpx.WriteTimeout("write timed out"), ProviderTimeoutError, True),
+        (httpx.ReadError("connection reset"), ProviderUnavailableError, True),
+        (httpx.RemoteProtocolError("server disconnected"), ProviderUnavailableError, True),
+    ],
+)
+def test_transport_failures_report_whether_tokens_may_have_been_consumed(exception, expected_type, may_have_consumed):
+    with pytest.raises(expected_type) as excinfo:
+        run(chat_once(make_provider(Upstream(raises=exception)), chat_request()))
+
+    assert excinfo.value.may_have_consumed_tokens is may_have_consumed
+    assert excinfo.value.usage is None
+
+
+@pytest.mark.parametrize(
+    "status, may_have_consumed",
+    [(400, False), (401, False), (404, False), (422, False), (429, False), (408, False), (500, True), (502, True), (503, True), (504, True)],
+)
+def test_http_errors_report_whether_tokens_may_have_been_consumed(status, may_have_consumed):
+    upstream = Upstream(httpx.Response(status, json={"error": {"message": "no"}}))
+
+    with pytest.raises(ProviderError) as excinfo:
+        run(chat_once(make_provider(upstream), chat_request()))
+
+    assert excinfo.value.may_have_consumed_tokens is may_have_consumed
+
+
+def test_unreadable_success_response_may_have_consumed_tokens():
+    with pytest.raises(ProviderError) as excinfo:
+        run(chat_once(make_provider(Upstream(httpx.Response(200, text="garbage"))), chat_request()))
+
+    assert excinfo.value.may_have_consumed_tokens is True
+
+
+@pytest.mark.parametrize(
+    "usage",
+    [{"prompt_tokens": 3}, {"prompt_tokens": -1, "completion_tokens": 2}, {"prompt_tokens": 1.5, "completion_tokens": 2}, {"prompt_tokens": True, "completion_tokens": 2}],
+)
+def test_malformed_usage_is_rejected_rather_than_guessed(usage):
+    upstream = Upstream(httpx.Response(200, json={**completion(), "usage": usage}))
+
+    with pytest.raises(ProviderError):
+        run(chat_once(make_provider(upstream), chat_request()))

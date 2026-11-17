@@ -14,13 +14,14 @@ import pytest
 import redis
 from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
-from sqlalchemy import delete, event, select
+from sqlalchemy import event
+
+from conftest import delete_committed_application
 
 from app.api.chat import get_chat_provider, router as v1_router
 from app.api.rate_limit import get_rate_limiter
 from app.core.config import settings
 from app.database.connection import SessionLocal, engine, get_db
-from app.database.models import ApiKey, ClientApplication
 from app.main import app, create_rate_limiter
 from app.providers.base import ChatMessage, ChatResponse, ModelInfo, ProviderUnavailableError, Usage
 from app.providers.fake import FAKE_MODEL, FakeProvider
@@ -236,10 +237,7 @@ def committed_key():
         yield plaintext
     finally:
         with SessionLocal() as db:
-            application_id = db.scalar(select(ClientApplication.id).where(ClientApplication.name == name))
-            db.execute(delete(ApiKey).where(ApiKey.application_id == application_id))
-            db.execute(delete(ClientApplication).where(ClientApplication.id == application_id))
-            db.commit()
+            delete_committed_application(db, name)
 
 
 def test_concurrent_http_requests_admit_exactly_the_burst(provider, limiter, committed_key):

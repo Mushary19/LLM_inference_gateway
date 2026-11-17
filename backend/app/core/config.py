@@ -60,6 +60,10 @@ class Settings(BaseSettings):
     rate_limit_requests_per_minute: int = Field(default=60, gt=0)  # sustained refill rate
     rate_limit_burst: int = Field(default=10, gt=0)  # bucket capacity
 
+    # Token quota given to applications created without an explicit --token-limit.
+    # A quota is a lifetime allowance: it never resets automatically.
+    default_token_quota: int = Field(default=1_000_000, ge=0)
+
     @model_validator(mode="after")
     def _check_gpu_memory(self) -> "Settings":
         if self.gpu_total_memory_mb <= self.gpu_model_memory_mb + self.gpu_runtime_memory_mb:

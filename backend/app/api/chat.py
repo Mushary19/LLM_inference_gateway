@@ -1,18 +1,25 @@
 """Gateway endpoints: POST /v1/chat/completions and GET /v1/models.
 
 Every /v1 route requires an API key (Authorization: Bearer <key>) and is rate-limited per
-key. Both checks run before the route, so a rejected request never reaches the provider.
-The routes call the configured provider directly, not the legacy /generate pipeline.
+key (see app/api/v1.py). Both checks run before the route, so a rejected request never
+reaches the provider. Chat completions also reserve token quota before calling the provider
+and settle it afterwards (see app/services/quota.py). The routes call the configured
+provider directly, not the legacy /generate pipeline.
 """
 
 import logging
 import time
 import uuid
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import Depends, HTTPException, Request, status
+from fastapi.concurrency import run_in_threadpool
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session
 
 from app.api.auth import AuthenticatedClient, require_api_key
-from app.api.rate_limit import enforce_rate_limit
+from app.api.v1 import router
+from app.core.config import settings
+from app.database.connection import get_db
 from app.providers.base import (
     ChatMessage,
     ChatRequest,
@@ -23,6 +30,7 @@ from app.providers.base import (
     ProviderError,
     ProviderTimeoutError,
     ProviderUnavailableError,
+    Usage,
 )
 from app.schemas.chat import (
     ChatChoice,
@@ -33,13 +41,9 @@ from app.schemas.chat import (
     ModelList,
     ModelObject,
 )
+from app.services import quota
 
 logger = logging.getLogger(__name__)
-
-# Router-level dependencies: every route added here is authenticated, then rate-limited, by
-# default. enforce_rate_limit depends on require_api_key, and routes that need the client
-# declare it too; FastAPI resolves it once per request, so the key is looked up only once.
-router = APIRouter(prefix="/v1", dependencies=[Depends(require_api_key), Depends(enforce_rate_limit)])
 
 # Most specific first; anything else from a provider is a bad gateway.
 _ERROR_STATUS: list[tuple[type[ProviderError], int]] = [
@@ -74,10 +78,11 @@ def _to_provider_request(body: ChatCompletionRequest) -> ChatRequest:
     )
 
 
-def _to_http_response(response: ChatResponse) -> ChatCompletionResponse:
+def _to_http_response(response: ChatResponse, request_id: uuid.UUID) -> ChatCompletionResponse:
     return ChatCompletionResponse(
-        # The gateway assigns the ID and timestamp; providers stay deterministic.
-        id=f"chatcmpl-{uuid.uuid4().hex}",
+        # The gateway assigns the ID (its request ID, also used for quota and usage records)
+        # and timestamp; providers stay deterministic.
+        id=f"chatcmpl-{request_id.hex}",
         created=int(time.time()),
         model=response.model,
         choices=[
@@ -87,7 +92,9 @@ def _to_http_response(response: ChatResponse) -> ChatCompletionResponse:
                 finish_reason=response.finish_reason,
             )
         ],
-        usage=ChatUsage(
+        usage=None
+        if response.usage is None
+        else ChatUsage(
             prompt_tokens=response.usage.prompt_tokens,
             completion_tokens=response.usage.completion_tokens,
             total_tokens=response.usage.total_tokens,
@@ -95,21 +102,105 @@ def _to_http_response(response: ChatResponse) -> ChatCompletionResponse:
     )
 
 
+def _insufficient_quota(exc: quota.InsufficientQuotaError) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        detail={
+            "code": "insufficient_quota",
+            "message": "Not enough token quota left for this request",
+            "required_tokens": exc.required_tokens,
+            "available_tokens": exc.available_tokens,
+        },
+    )
+
+
+async def _settle(
+    db: Session,
+    reservation: quota.Reservation,
+    *,
+    usage: Usage | None,
+    succeeded: bool,
+    may_have_consumed_tokens: bool,
+    model: str,
+    started: float,
+) -> None:
+    """Settle the reservation. If the database fails, keep the response: the provider has
+    already done the work. The reservation stays `reserved` and holds its tokens until
+    `python -m app.cli expire-reservations` settles it."""
+    try:
+        await run_in_threadpool(
+            quota.settle,
+            db,
+            reservation.reservation_id,
+            usage=usage,
+            succeeded=succeeded,
+            may_have_consumed_tokens=may_have_consumed_tokens,
+            model=model,
+            latency_ms=(time.monotonic() - started) * 1000,
+        )
+    except (SQLAlchemyError, quota.QuotaNotFoundError):
+        logger.exception(
+            "Could not settle quota reservation for request %s; it stays reserved until expired",
+            reservation.request_id,
+        )
+
+
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     body: ChatCompletionRequest,
     provider: Provider = Depends(get_chat_provider),
     client: AuthenticatedClient = Depends(require_api_key),
+    db: Session = Depends(get_db),
 ) -> ChatCompletionResponse:
     logger.info(
         "Chat completion for application %s (key %s), model %s",
         client.application_name, client.key_prefix, body.model,
     )
+    request_id = uuid.uuid4()
+    provider_request = _to_provider_request(body)
+    estimate = quota.estimate_request_tokens(
+        provider_request.messages, body.max_tokens or settings.max_generation_tokens
+    )
+    # Transaction 1 (commits, releasing the connection before the provider call).
     try:
-        response = await provider.chat(_to_provider_request(body))
+        reservation = await run_in_threadpool(
+            quota.reserve,
+            db,
+            application_id=client.application_id,
+            api_key_id=client.api_key_id,
+            request_id=request_id,
+            tokens=estimate,
+            provider=provider.name,
+            model=body.model,
+        )
+    except quota.InsufficientQuotaError as exc:
+        logger.info("Insufficient quota for application %s (key %s)", client.application_name, client.key_prefix)
+        raise _insufficient_quota(exc) from exc
+    except SQLAlchemyError as exc:
+        logger.exception("Could not reserve quota for request %s", request_id)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Quota accounting is temporarily unavailable",
+        ) from exc
+
+    # Provider call: no database transaction or connection is held here. A non-provider
+    # exception (a bug) or cancellation leaves the reservation for expire-reservations.
+    started = time.monotonic()
+    try:
+        response = await provider.chat(provider_request)
     except ProviderError as exc:
+        await _settle(
+            db, reservation, usage=exc.usage, succeeded=False,
+            may_have_consumed_tokens=exc.may_have_consumed_tokens, model=body.model, started=started,
+        )
         raise _provider_http_error(provider, exc)
-    return _to_http_response(response)
+
+    # Transaction 2.
+    await _settle(
+        db, reservation, usage=response.usage, succeeded=True,
+        may_have_consumed_tokens=True, model=response.model, started=started,
+    )
+    return _to_http_response(response, request_id)
 
 
 @router.get("/models", response_model=ModelList)

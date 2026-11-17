@@ -332,6 +332,213 @@ docker compose up -d --wait redis          # development Redis on localhost:1637
 Rate-limit state is short-lived, so this Redis keeps nothing on disk. Restarting it resets every
 bucket.
 
+## Token quotas and usage accounting
+
+Three separate controls apply to a `/v1/chat/completions` request:
+
+| | What it limits | Where | Resets |
+|---|---|---|---|
+| **Rate limit** | requests per key per minute | Redis token bucket | refills continuously |
+| **Token quota** | total tokens per **application** | PostgreSQL `token_quotas` | never automatically |
+| **Actual usage** | nothing: it's what the provider reports it used | PostgreSQL `usage_records` | it's a record |
+
+Every client application has one token quota, shared by all of its keys:
+
+- `limit_tokens`: the allowance.
+- `consumed_tokens`: tokens charged so far.
+- `reserved_tokens`: tokens held by requests that are still running.
+- `available = max(0, limit - consumed - reserved)`.
+
+### How a request uses the quota
+
+1. **Estimate.** The gateway can't tokenize for every model, so it estimates conservatively:
+   the UTF-8 byte length of every message, plus 16 tokens per message and 64 per request for
+   chat-template framing, plus `max_tokens` (or `MAX_GENERATION_TOKENS` if the request doesn't set
+   it). Byte-level BPE tokenizers (GPT, Llama 3, Qwen) never produce more tokens than bytes, so
+   for them this is an upper bound. It is **not** exact, and other tokenizers aren't guaranteed to
+   stay under it.
+2. **Reserve** (one transaction). The application's quota row is locked with `SELECT ... FOR
+   UPDATE`. If the estimate doesn't fit in `available`, the request is rejected: `429` with code
+   `insufficient_quota`, and the provider is never called. Otherwise a reservation is recorded,
+   `reserved_tokens` grows, and the transaction commits. That releases the database connection
+   **before** the provider is called.
+3. **Call the provider.** No database transaction or connection is held while it runs.
+4. **Settle** (one transaction). The reservation's tokens move from `reserved` to `consumed`,
+   according to the table below, and a usage record is written.
+
+| What happened | Charged | Usage record |
+|---|---|---|
+| Provider reported usage | the **actual** total, even if above the reservation | yes, with token counts |
+| Success, but no usage reported | the full reservation (conservative) | yes; counts `null`, `usage_reported: false` |
+| Provider failed and certainly did nothing (refused the request, connection refused) | nothing: reservation `released` | no |
+| Provider failed and may have run (read timeout, dropped connection, 5xx, unreadable reply) | the full reservation, or the actual usage if it was reported | yes, `status: failed` |
+
+The provider adapter decides whether a failure may have consumed tokens, because that's
+provider knowledge. Token counts are never invented: unreported usage stays `null`, and the
+conservative charge appears only in `charged_tokens`.
+
+### The quota is a soft limit
+
+The quota is a **soft quota**, not a guaranteed spending cap. It's checked **before** a request
+runs, against an estimate, and then the gateway charges what the provider **actually** used,
+which can be more.
+
+Example:
+
+| | Tokens |
+|---|---|
+| Available before the request | 5,000 |
+| Reserved (the estimate) | 5,000 |
+| Actually used, as reported by the provider | 6,500 |
+| Charged | **6,500** |
+
+After this request, `consumed_tokens` is 1,500 above the limit. `available_tokens` shows **0**
+(never negative), and every further request gets `insufficient_quota` until the limit is raised.
+
+This is deliberate. The provider has already done, and billed, the work, so recording less than
+was really used would only hide real consumption. Accurate accounting matters more here than a
+hard cap. How far over the limit an application can go:
+
+- per request, by however much its actual usage exceeds its estimate;
+- with several requests running at once, by the sum of those overruns.
+
+The estimate includes the request's full output allowance (`max_tokens`, or
+`MAX_GENERATION_TOKENS`), so the prompt estimate is the main way to go over. Any overrun is
+visible: compare `charged_tokens` with the reservation, or `consumed_tokens` with
+`limit_tokens` in `GET /v1/usage/quota`.
+
+A guaranteed hard cap would need the provider to stop generating at the remaining budget. That
+isn't implemented.
+
+**Exactly once.** Settlement locks the quota row, then the reservation, and does nothing if the
+reservation was already settled. Each request has a unique `request_id`, which is also the
+`chatcmpl-...` ID returned to the client. Both reservations and usage records are unique per
+request, so settling the same request again can never charge it twice. The counters only change
+together with the rows they summarize, inside that one locked transaction.
+
+### Failures and recovery
+
+- **Database down when reserving:** `503 {"detail": "Quota accounting is temporarily
+  unavailable"}`; the provider is not called.
+- **Database down when settling, or a process crash:** the response is still returned when
+  possible, since the provider already did the work. The reservation stays `reserved` and keeps
+  holding its tokens. The same applies if a request is cancelled mid-call. (Whether a client
+  disconnect cancels a non-streamed request depends on the server; this hasn't been verified
+  here.) Recover it with
+  ```bash
+  python -m app.cli expire-reservations --older-than-minutes 60
+  ```
+  which settles every reservation older than that as `expired`, charging its reserved tokens
+  (the actual usage is unknown). Run it periodically, for example from cron, with an age well
+  above the provider timeout (`OPENAI_COMPATIBLE_TIMEOUT_SECONDS`), so it never settles a
+  request that is still running. There is no background worker.
+
+### Managing quotas
+
+```bash
+python -m app.cli create-app billing-service --token-limit 500000   # default: DEFAULT_TOKEN_QUOTA
+python -m app.cli set-quota --app billing-service --limit 2000000
+python -m app.cli show-quota --app billing-service
+```
+
+Quotas don't reset on their own. To give an application more tokens, raise its limit.
+
+If an application's quota row has been deleted (only possible by hand), `set-quota` recreates it
+with its counters **rebuilt from the reservation history**:
+`reserved_tokens` = the tokens of reservations still `reserved`, and `consumed_tokens` = the
+tokens charged by every settled one. Requests that were in flight then settle normally, and
+`consumed` reflects past usage again. While the row is missing, chat requests get
+`insufficient_quota`, and settling a reservation leaves it `reserved` until the row is back.
+
+### `GET /v1/usage`
+
+Usage of the **authenticated key's application** only (all of its keys). Query parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `start`, `end` | ISO 8601 times; `start` is inclusive, `end` is exclusive; UTC if no offset is given |
+| `model`, `provider` | exact match |
+| `limit`, `offset` | page of records, newest first (`limit` 1–200, default 50) |
+
+```json
+{
+  "object": "usage",
+  "filters": {"start": null, "end": null, "model": null, "provider": null},
+  "summary": {
+    "requests": 2,
+    "requests_without_reported_usage": 0,
+    "prompt_tokens": 24,
+    "completion_tokens": 61,
+    "total_tokens": 85,
+    "charged_tokens": 85
+  },
+  "data": [
+    {
+      "request_id": "chatcmpl-4f2c...",
+      "created_at": "2026-11-16T18:20:33.511Z",
+      "key_prefix": "if_k3F9xQ2m",
+      "provider": "openai_compatible",
+      "model": "llama-3.1-8b-instant",
+      "status": "succeeded",
+      "usage_reported": true,
+      "prompt_tokens": 12,
+      "completion_tokens": 30,
+      "total_tokens": 42,
+      "charged_tokens": 42,
+      "latency_ms": 812.4
+    }
+  ],
+  "pagination": {"limit": 50, "offset": 0, "has_more": true}
+}
+```
+
+The summary covers every matching record, not just the page. The token sums include
+provider-reported counts only; `charged_tokens` is what came off the quota.
+
+### `GET /v1/usage/quota`
+
+```json
+{"object": "quota", "limit_tokens": 1000000, "consumed_tokens": 85, "reserved_tokens": 0, "available_tokens": 999915}
+```
+
+An application without a quota row gets `404` here, and `insufficient_quota` on chat requests.
+Both usage endpoints are on the `/v1` router, so they require an API key and are rate-limited.
+`GET /v1/models` doesn't use quota.
+
+### When quota runs out
+
+```json
+{"detail": {"code": "insufficient_quota", "message": "Not enough token quota left for this request",
+            "required_tokens": 92, "available_tokens": 40}}
+```
+
+It's a `429` like the rate limit, but it has **no** `Retry-After`: the quota doesn't refill on
+its own.
+
+### Applying the schema
+
+Migration `77dc84617c96` adds `token_quotas`, `quota_reservations` and `usage_records`, and gives
+every existing application a quota of 1,000,000 tokens. Apply it to the development database
+deliberately:
+
+```bash
+cd backend && alembic upgrade head      # expect 77dc84617c96 (head) afterwards
+```
+
+### Limitations
+
+- **Soft quota.** Usage above an estimate is charged in full, so consumption can go past the limit
+  (see "The quota is a soft limit" above).
+- **Estimates aren't exact.** A request can be rejected even though slightly less than its
+  estimate would really have been needed.
+- **Missing usage costs the full reservation.** If a provider never reports usage, every request
+  costs its full reservation.
+- **Stale reservations need the recovery command.** Until `expire-reservations` runs, they keep
+  holding tokens.
+- **No resets, billing or per-key quotas.** Quotas are per application.
+- **No streaming yet.** Quota handling covers non-streamed requests only, because streaming isn't
+  implemented.
+
 ## Testing
 
 Automated tests run against their own PostgreSQL container, `test-db`, and never touch the

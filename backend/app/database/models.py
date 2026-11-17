@@ -9,6 +9,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -231,3 +232,172 @@ class ApiKey(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     application: Mapped[ClientApplication] = relationship(back_populates="api_keys")
+
+
+class ReservationStatus(str, enum.Enum):
+    RESERVED = "reserved"  # tokens held while the request runs
+    RECONCILED = "reconciled"  # settled: charged actual usage (or the reservation, if unknown)
+    RELEASED = "released"  # settled: nothing was consumed, nothing charged
+    EXPIRED = "expired"  # never settled by its request; settled later, charging the reservation
+
+
+class UsageStatus(str, enum.Enum):
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"  # the provider failed but may have consumed (or reported) tokens
+    EXPIRED = "expired"  # from an expired reservation; actual outcome unknown
+
+
+_RESERVATION_STATUSES = ", ".join(f"'{s.value}'" for s in ReservationStatus)
+_USAGE_STATUSES = ", ".join(f"'{s.value}'" for s in UsageStatus)
+
+
+class TokenQuota(Base):
+    """An application's token allowance. No automatic reset: the limit is lifetime and is
+    changed only explicitly (CLI set-quota).
+
+    consumed_tokens and reserved_tokens are kept in step with quota_reservations and are only
+    changed while this row is locked, in the same transaction as the reservation they reflect:
+      reserved_tokens = sum of reserved_tokens of reservations in status 'reserved'
+      consumed_tokens = sum of charged_tokens of all settled reservations
+    """
+
+    __tablename__ = "token_quotas"
+    __table_args__ = (
+        CheckConstraint("limit_tokens >= 0", name="ck_token_quotas_limit_non_negative"),
+        CheckConstraint("consumed_tokens >= 0", name="ck_token_quotas_consumed_non_negative"),
+        CheckConstraint("reserved_tokens >= 0", name="ck_token_quotas_reserved_non_negative"),
+    )
+
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey(
+            "client_applications.id",
+            name="fk_token_quotas_application_id_client_applications",
+            ondelete="CASCADE",
+        ),
+        primary_key=True,
+    )
+    limit_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    consumed_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    reserved_tokens: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    @property
+    def available_tokens(self) -> int:
+        # Usage above a reservation is still charged, so consumed can exceed the limit;
+        # availability never goes below zero.
+        return max(0, self.limit_tokens - self.consumed_tokens - self.reserved_tokens)
+
+
+class QuotaReservation(Base):
+    """Tokens held for one in-flight request, from before the provider call until settlement."""
+
+    __tablename__ = "quota_reservations"
+    __table_args__ = (
+        UniqueConstraint("request_id", name="uq_quota_reservations_request_id"),
+        CheckConstraint("reserved_tokens > 0", name="ck_quota_reservations_reserved_positive"),
+        CheckConstraint("actual_tokens >= 0", name="ck_quota_reservations_actual_non_negative"),
+        CheckConstraint("charged_tokens >= 0", name="ck_quota_reservations_charged_non_negative"),
+        CheckConstraint(f"status IN ({_RESERVATION_STATUSES})", name="ck_quota_reservations_status_valid"),
+        CheckConstraint(
+            "(status = 'reserved' AND charged_tokens IS NULL AND actual_tokens IS NULL AND settled_at IS NULL)"
+            " OR (status = 'released' AND charged_tokens = 0 AND actual_tokens IS NULL AND settled_at IS NOT NULL)"
+            " OR (status = 'reconciled' AND charged_tokens IS NOT NULL AND settled_at IS NOT NULL)"
+            " OR (status = 'expired' AND charged_tokens = reserved_tokens AND actual_tokens IS NULL"
+            " AND settled_at IS NOT NULL)",
+            name="ck_quota_reservations_settlement_consistent",
+        ),
+        Index("ix_quota_reservations_status_created_at", "status", "created_at"),
+        Index("ix_quota_reservations_application_id", "application_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()")
+    )
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("client_applications.id", name="fk_quota_reservations_application_id_client_applications"),
+        nullable=False,
+    )
+    api_key_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("api_keys.id", name="fk_quota_reservations_api_key_id_api_keys"), nullable=False
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    # Recorded up front so a reservation settled later (expired) still has a complete record.
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    reserved_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    actual_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    charged_tokens: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    status: Mapped[ReservationStatus] = mapped_column(
+        Enum(ReservationStatus, native_enum=False, length=20, values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+        default=ReservationStatus.RESERVED,
+        server_default=ReservationStatus.RESERVED.value,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class UsageRecord(Base):
+    """Token usage of one settled request. Token counts are only what the provider reported."""
+
+    __tablename__ = "usage_records"
+    __table_args__ = (
+        UniqueConstraint("reservation_id", name="uq_usage_records_reservation_id"),
+        UniqueConstraint("request_id", name="uq_usage_records_request_id"),
+        CheckConstraint("charged_tokens >= 0", name="ck_usage_records_charged_non_negative"),
+        CheckConstraint("latency_ms IS NULL OR latency_ms >= 0", name="ck_usage_records_latency_non_negative"),
+        CheckConstraint(f"status IN ({_USAGE_STATUSES})", name="ck_usage_records_status_valid"),
+        CheckConstraint(
+            "(usage_reported AND prompt_tokens >= 0 AND completion_tokens >= 0"
+            " AND total_tokens = prompt_tokens + completion_tokens)"
+            " OR (NOT usage_reported AND prompt_tokens IS NULL AND completion_tokens IS NULL"
+            " AND total_tokens IS NULL)",
+            name="ck_usage_records_token_counts_consistent",
+        ),
+        Index("ix_usage_records_application_id_created_at", "application_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, primary_key=True, default=uuid.uuid4, server_default=text("gen_random_uuid()")
+    )
+    reservation_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("quota_reservations.id", name="fk_usage_records_reservation_id_quota_reservations"),
+        nullable=False,
+    )
+    request_id: Mapped[uuid.UUID] = mapped_column(Uuid, nullable=False)
+    application_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("client_applications.id", name="fk_usage_records_application_id_client_applications"),
+        nullable=False,
+    )
+    api_key_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("api_keys.id", name="fk_usage_records_api_key_id_api_keys"), nullable=False
+    )
+    provider: Mapped[str] = mapped_column(Text, nullable=False)
+    model: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    completion_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    usage_reported: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    charged_tokens: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    status: Mapped[UsageStatus] = mapped_column(
+        Enum(UsageStatus, native_enum=False, length=20, values_callable=lambda e: [m.value for m in e]),
+        nullable=False,
+    )
+    latency_ms: Mapped[float | None] = mapped_column(Float, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

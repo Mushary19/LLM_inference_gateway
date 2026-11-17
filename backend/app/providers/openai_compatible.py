@@ -92,12 +92,21 @@ class OpenAICompatibleProvider:
 
     async def _request_json(self, method: str, path: str, **kwargs: Any) -> Any:
         """Send a request and return the decoded JSON body, or raise a normalized ProviderError."""
+        # may_have_consumed_tokens: False only when the request certainly never ran (it was
+        # never sent, or the provider answered with an error); otherwise work may have happened.
         try:
             response = await self._client.request(method, path, **kwargs)
         except httpx.TimeoutException as exc:
-            raise ProviderTimeoutError(f"provider did not respond in time ({type(exc).__name__})") from exc
+            never_sent = isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout))
+            raise ProviderTimeoutError(
+                f"provider did not respond in time ({type(exc).__name__})",
+                may_have_consumed_tokens=not never_sent,
+            ) from exc
         except httpx.TransportError as exc:
-            raise ProviderUnavailableError(f"could not reach provider: {exc}") from exc
+            raise ProviderUnavailableError(
+                f"could not reach provider: {exc}",
+                may_have_consumed_tokens=not isinstance(exc, httpx.ConnectError),
+            ) from exc
 
         if response.status_code >= 400:
             raise self._error_for_status(response)
@@ -111,37 +120,49 @@ class OpenAICompatibleProvider:
         status = response.status_code
         code, message = _error_details(response)
         detail = f"provider returned HTTP {status}: {message}"
+        # A 4xx means the provider refused the request. A 5xx may come from a proxy after the
+        # model already ran, so it is treated as possibly consuming tokens.
+        consumed = status >= 500
         if status == 404 or code == "model_not_found":
             return ModelNotFoundError(detail)
         if status in _TIMEOUT_STATUSES:
-            return ProviderTimeoutError(detail)
+            return ProviderTimeoutError(detail, may_have_consumed_tokens=consumed)
         if status in _UNAVAILABLE_STATUSES:
-            return ProviderUnavailableError(detail)
+            return ProviderUnavailableError(detail, may_have_consumed_tokens=consumed)
         if status in (400, 413, 422):
             return InvalidProviderRequestError(detail)
         # 401/403 (gateway misconfigured), other 4xx and 5xx: the gateway can't fix these.
-        return ProviderError(detail)
+        return ProviderError(detail, may_have_consumed_tokens=consumed)
 
     @staticmethod
     def _parse_chat_response(body: Any, requested_model: str) -> ChatResponse:
         try:
             choice = body["choices"][0]
             content = choice["message"].get("content") or ""
-            usage = body.get("usage") or {}
-            prompt_tokens = int(usage.get("prompt_tokens", 0))
-            completion_tokens = int(usage.get("completion_tokens", 0))
             model = body.get("model") or requested_model
+            usage = _parse_usage(body.get("usage"))
         except (KeyError, IndexError, TypeError, ValueError, AttributeError) as exc:
+            # The provider answered 200, so the model probably ran even though we can't read it.
             raise ProviderError(f"invalid chat completion response from provider: {exc!r}") from exc
 
-        if "usage" not in body:
-            logger.warning("Provider response for %s has no usage; reporting 0 tokens", model)
+        if usage is None:
+            logger.warning("Provider response for %s has no usage; token usage is unknown", model)
         return ChatResponse(
             model=str(model),
             message=ChatMessage(role="assistant", content=str(content)),
             finish_reason=_finish_reason(choice.get("finish_reason")),
-            usage=Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+            usage=usage,
         )
+
+
+def _parse_usage(raw: Any) -> Usage | None:
+    """None when the provider sent no usage; an error when it sent usage we can't trust."""
+    if raw is None:
+        return None
+    prompt_tokens, completion_tokens = raw["prompt_tokens"], raw["completion_tokens"]
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (prompt_tokens, completion_tokens)):
+        raise ValueError(f"invalid usage counts {prompt_tokens!r}, {completion_tokens!r}")
+    return Usage(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
 
 
 def _finish_reason(value: Any) -> FinishReason:

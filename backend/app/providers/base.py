@@ -38,7 +38,8 @@ class ChatResponse:
     model: str
     message: ChatMessage
     finish_reason: FinishReason
-    usage: Usage
+    # None when the provider didn't report token usage. Never filled with guesses.
+    usage: Usage | None
 
 
 @dataclass(frozen=True)
@@ -63,7 +64,29 @@ class HealthStatus:
 
 
 class ProviderError(Exception):
-    """Base class for failures reported by a provider."""
+    """Base class for failures reported by a provider.
+
+    `may_have_consumed_tokens` tells quota accounting whether the provider might have done
+    (and billed) work before failing; adapters set it per failure, otherwise each class
+    has a conservative default. `usage` is set when the provider reported usage anyway.
+    """
+
+    default_may_have_consumed_tokens = True
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        may_have_consumed_tokens: bool | None = None,
+        usage: Usage | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.may_have_consumed_tokens = (
+            self.default_may_have_consumed_tokens
+            if may_have_consumed_tokens is None
+            else may_have_consumed_tokens
+        )
+        self.usage = usage
 
 
 class ProviderUnavailableError(ProviderError):
@@ -77,9 +100,13 @@ class ProviderTimeoutError(ProviderError):
 class ModelNotFoundError(ProviderError):
     """The requested model is not served by this provider."""
 
+    default_may_have_consumed_tokens = False
+
 
 class InvalidProviderRequestError(ProviderError):
     """The provider rejected the request as invalid (e.g. context too long)."""
+
+    default_may_have_consumed_tokens = False
 
 
 class Provider(Protocol):
