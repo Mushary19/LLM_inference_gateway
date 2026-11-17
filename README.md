@@ -3,7 +3,9 @@
 A simplified AI inference gateway and resource manager.
 
 > Status: work in progress. Request API, admission control, scheduler, simulated GPU memory
-> accounting and real CPU inference with a small Hugging Face model are implemented.
+> accounting and real CPU inference with a small Hugging Face model are implemented, as is an
+> OpenAI-compatible gateway (`/v1`) with API keys, rate limiting, token quotas and a model
+> registry that routes public model IDs to multiple providers.
 
 ## Tech stack
 
@@ -193,6 +195,213 @@ The scheduler's "GPU memory" and KV-cache blocks (see above) are **accounting on
 measure or limit the real CPU RAM used by PyTorch, and the KV-block sizing doesn't come from
 Qwen's architecture. A request can be refused for lack of simulated KV blocks while plenty of
 RAM is free, or the process can use more RAM than the simulation suggests.
+
+## Model registry
+
+The gateway can route to several providers. The model registry maps each **public model ID**,
+the only name clients use, to a configured **provider instance** and the model ID **that
+provider** uses:
+
+| Public model ID (clients) | Provider instance | Adapter type | Provider model ID (upstream) |
+|---|---|---|---|
+| `llama-3.3-70b` | `groq` | `openai_compatible` | `llama-3.3-70b-versatile` |
+| `qwen-local` | `ollama` | `openai_compatible` | `qwen2.5:7b` |
+| `fake-model` | `fake` | `fake` | `fake-model` |
+
+A request for `llama-3.3-70b` goes to the `groq` instance as `llama-3.3-70b-versatile`. The
+response's `model` field is always the public ID, whatever name the upstream reports. Routing
+is deterministic: one public ID maps to exactly one provider. There is no failover, load
+balancing or health-based routing.
+
+### Configuration
+
+The registry is a JSON file. Copy the example and edit it:
+
+```bash
+cd backend
+cp models.example.json models.json     # models.json is gitignored
+echo 'MODEL_REGISTRY_FILE=models.json' >> .env
+```
+
+```json
+{
+  "providers": {
+    "groq":   {"type": "openai_compatible", "base_url": "https://api.groq.com/openai/v1",
+               "api_key_env": "GROQ_API_KEY", "timeout_seconds": 60},
+    "ollama": {"type": "openai_compatible", "base_url": "http://localhost:11434/v1",
+               "timeout_seconds": 120},
+    "fake":   {"type": "fake"}
+  },
+  "models": {
+    "llama-3.3-70b": {"provider": "groq",   "provider_model_id": "llama-3.3-70b-versatile"},
+    "qwen-local":    {"provider": "ollama", "provider_model_id": "qwen2.5:7b", "enabled": false},
+    "fake-model":    {"provider": "fake",   "provider_model_id": "fake-model"}
+  }
+}
+```
+
+**`providers`**: one entry per provider instance. The key is the instance name: lower-case
+letters, digits, `-` and `_`. It is recorded in usage records.
+
+| Field | Types | Meaning |
+|---|---|---|
+| `type` | all | `openai_compatible` (any OpenAI-style `/chat/completions` API: Groq, Ollama, vLLM, ...) or `fake` (deterministic test provider; serves only `fake-model`) |
+| `base_url` | `openai_compatible`, required | `http://` or `https://` URL, without credentials |
+| `api_key_env` | `openai_compatible`, optional | **Name** of the environment variable holding the bearer token. Omit it for servers that need no key (Ollama). |
+| `timeout_seconds` | `openai_compatible`, optional | Whole-request timeout, including generation (default 60) |
+
+**`models`**: one entry per public model ID. The key is the public ID: letters, digits and
+`. _ : / -`, starting with a letter or digit, at most 128 characters, case-sensitive.
+
+| Field | Meaning |
+|---|---|
+| `provider` | A provider instance name from `providers` |
+| `provider_model_id` | What that provider calls the model (no whitespace) |
+| `enabled` | Optional, default `true`. A disabled model behaves exactly like an unknown one. |
+
+Several models can share one provider. Each provider is built **once**, so they share its HTTP
+connection pool.
+
+**Path resolution:** a relative `MODEL_REGISTRY_FILE` is resolved against the `backend/`
+directory (where `.env` lives), not the current working directory. An absolute path is used
+as-is. If `MODEL_REGISTRY_FILE` is unset, the gateway serves only `fake-model` from the fake
+provider.
+
+### API keys
+
+Keys are **never** written in the JSON file. Each provider names the environment variable that
+holds its key, and each provider gets its own variable:
+
+```bash
+# backend/.env (or the process environment, which takes precedence)
+GROQ_API_KEY=gsk_...
+OPENROUTER_API_KEY=sk-or-...
+```
+
+Keys are read at startup and passed straight to the provider's HTTP client. They never appear
+in logs, error messages, `repr` output or API responses. A `base_url` containing credentials
+(`https://user:pass@host`) is rejected, so a key can't slip in that way either.
+
+### Validation
+
+The whole file is validated at startup, and any problem stops the application with a message
+naming each bad field. Rejected:
+
+- invalid JSON;
+- **duplicate keys** in any object (JSON normally keeps the last one silently);
+- unknown fields;
+- unknown provider types;
+- models referencing a missing provider;
+- missing required fields;
+- malformed IDs;
+- wrong value types (`"60"` is not a number, `"false"` is not a boolean);
+- a non-positive timeout;
+- an `api_key_env` variable that is unset or empty.
+
+Error messages give locations and reasons, never values from the file or the environment.
+
+### Changes require a restart
+
+The registry is built once when the application starts and is immutable afterwards. To add,
+remove, enable or disable a model, or to rotate a key, edit the file or environment and
+restart. This keeps routing free of locks and partial-reload states.
+
+### `GET /v1/models` lists registered models
+
+`GET /v1/models` returns the **enabled public models in the registry**, sorted by ID. It does
+not ask the providers what they serve:
+
+```json
+{"object": "list", "data": [{"id": "llama-3.3-70b", "object": "model", "created": 0, "owned_by": "inferenceflow"}]}
+```
+
+What an upstream serves (under its own names) is not what this gateway routes. Listing
+upstream models would advertise IDs that fail when sent here, leak provider-specific names,
+and make the endpoint fail whenever one provider is down. The listing never exposes provider
+instance names, provider model IDs, URLs or keys, and it works while every provider is
+unreachable. Authentication and rate limiting still apply.
+
+### Unknown models and provider errors
+
+An unknown **or disabled** model gets `404` before any quota work: no reservation, no usage
+record, no provider call.
+
+```json
+{"detail": {"code": "model_not_found", "message": "The requested model was not found."}}
+```
+
+Provider failures keep their status codes, with fixed public messages. Upstream details
+(internal URLs, provider model IDs, response bodies) go to the server log only.
+
+| Provider failure | Status | `detail` |
+|---|---|---|
+| Unavailable (connection refused, 429/502/503) | 503 | `The provider is temporarily unavailable.` |
+| Timeout | 504 | `The provider did not respond in time.` |
+| Rejected the request as invalid (400/413/422) | 400 | `The provider rejected the request: <sanitized upstream message>` |
+| Model not found **upstream** | **502** | `The provider could not serve the requested model.` |
+| Anything else (401/403, 5xx, unreadable reply) | 502 | `The provider returned an unexpected response.` |
+
+The 400 message is kept because clients need it (for example, "context length exceeded"). It
+is sanitized before it is returned:
+- the adapter's `provider returned HTTP 400:` prefix is dropped;
+- the provider model ID is replaced with the public one;
+- URLs and IP addresses become `[redacted]`;
+- control characters are removed;
+- the message is capped at 300 characters.
+
+An upstream "model not found" for a registered model means the registry is misconfigured (a
+wrong `provider_model_id`), so it is a `502`, not a `404`. It is logged at error level.
+
+### Usage records
+
+Reservations and usage records store the **provider instance name** (`groq`) and the **public
+model ID** (`llama-3.3-70b`), so `/v1/usage?model=llama-3.3-70b&provider=groq` matches
+regardless of what the upstream calls the model. Failed requests are recorded the same way.
+
+Records written **before** the registry existed are left untouched. They contain the old
+adapter name (`openai_compatible`) and the upstream model name the provider reported (for
+example, `llama-3.3-70b-versatile`). A filter matches one naming convention at a time, so a
+query across the transition must be made once with each name. No data is migrated or
+rewritten.
+
+### Migrating from the legacy provider settings
+
+`CHAT_PROVIDER`, `OPENAI_COMPATIBLE_BASE_URL`, `OPENAI_COMPATIBLE_API_KEY` and
+`OPENAI_COMPATIBLE_TIMEOUT_SECONDS` are no longer read. A deployment still set to
+`CHAT_PROVIDER=openai_compatible` with no `MODEL_REGISTRY_FILE` **refuses to start** with a
+migration error, rather than silently falling back to the fake provider.
+
+Given an old `.env` such as
+
+```bash
+CHAT_PROVIDER=openai_compatible
+OPENAI_COMPATIBLE_BASE_URL=https://api.groq.com/openai/v1
+OPENAI_COMPATIBLE_API_KEY=gsk_...
+OPENAI_COMPATIBLE_TIMEOUT_SECONDS=120
+```
+
+1. Create `backend/models.json`. Describe the provider once, then register every model clients
+   use. Previously any model name was passed through; now only registered public IDs are
+   accepted.
+   ```json
+   {
+     "providers": {
+       "groq": {"type": "openai_compatible", "base_url": "https://api.groq.com/openai/v1",
+                "api_key_env": "GROQ_API_KEY", "timeout_seconds": 120}
+     },
+     "models": {
+       "llama-3.3-70b-versatile": {"provider": "groq", "provider_model_id": "llama-3.3-70b-versatile"}
+     }
+   }
+   ```
+   Using the upstream name as the public ID, as above, keeps existing clients working
+   unchanged. You can introduce shorter public IDs later.
+2. Move the key to the variable named by `api_key_env`: `GROQ_API_KEY=gsk_...`. Pointing
+   `api_key_env` at `"OPENAI_COMPATIBLE_API_KEY"` also works, but a provider-specific name is
+   clearer once there are several providers.
+3. Set `MODEL_REGISTRY_FILE=models.json`, remove the four legacy variables, and restart.
+
+If `MODEL_REGISTRY_FILE` is set, `CHAT_PROVIDER` is ignored, with a warning in the log.
 
 ## API key authentication
 
@@ -429,9 +638,11 @@ together with the rows they summarize, inside that one locked transaction.
   python -m app.cli expire-reservations --older-than-minutes 60
   ```
   which settles every reservation older than that as `expired`, charging its reserved tokens
-  (the actual usage is unknown). Run it periodically, for example from cron, with an age well
-  above the provider timeout (`OPENAI_COMPATIBLE_TIMEOUT_SECONDS`), so it never settles a
-  request that is still running. There is no background worker.
+  (the actual usage is unknown). Run it periodically, for example from cron. The age must be
+  well above the **longest** `timeout_seconds` of any provider in the model registry, with a
+  safety margin, so it never settles a request that is still running. For example, with a
+  slowest provider at 120 s, use at least 10 minutes. The default of 60 minutes covers any
+  sensible timeout. There is no background worker.
 
 ### Managing quotas
 
@@ -477,8 +688,8 @@ Usage of the **authenticated key's application** only (all of its keys). Query p
       "request_id": "chatcmpl-4f2c...",
       "created_at": "2026-11-16T18:20:33.511Z",
       "key_prefix": "if_k3F9xQ2m",
-      "provider": "openai_compatible",
-      "model": "llama-3.1-8b-instant",
+      "provider": "groq",
+      "model": "llama-3.1-8b",
       "status": "succeeded",
       "usage_reported": true,
       "prompt_tokens": 12,
@@ -494,6 +705,10 @@ Usage of the **authenticated key's application** only (all of its keys). Query p
 
 The summary covers every matching record, not just the page. The token sums include
 provider-reported counts only; `charged_tokens` is what came off the quota.
+
+`provider` is the provider instance name and `model` the public model ID from the model
+registry. Records written before the registry may use the old names (see "Usage records" under
+"Model registry").
 
 ### `GET /v1/usage/quota`
 
