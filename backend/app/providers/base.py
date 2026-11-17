@@ -69,6 +69,8 @@ class ProviderError(Exception):
     `may_have_consumed_tokens` tells quota accounting whether the provider might have done
     (and billed) work before failing; adapters set it per failure, otherwise each class
     has a conservative default. `usage` is set when the provider reported usage anyway.
+    `status_code` is the upstream HTTP status when the failure was an HTTP error response,
+    None otherwise (transport failures, unreadable responses).
     """
 
     default_may_have_consumed_tokens = True
@@ -79,8 +81,10 @@ class ProviderError(Exception):
         *,
         may_have_consumed_tokens: bool | None = None,
         usage: Usage | None = None,
+        status_code: int | None = None,
     ) -> None:
         super().__init__(message)
+        self.status_code = status_code
         self.may_have_consumed_tokens = (
             self.default_may_have_consumed_tokens
             if may_have_consumed_tokens is None

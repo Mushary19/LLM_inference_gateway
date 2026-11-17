@@ -141,26 +141,42 @@ class ModelRegistry:
     """Immutable mapping of public model IDs to routes. Owns its provider instances.
 
     Lookups are exact and case-sensitive. Disabled models behave exactly like unknown ones
-    for callers; the registry only remembers them so the error can say which it was.
+    for callers. The registry still remembers them, so the error can say which it was, and
+    keeps their routes (when given) so diagnostics can check them before they're enabled.
     """
 
     def __init__(
         self,
         providers: Mapping[str, Provider],
         routes: Iterable[ModelRoute],
-        disabled: Iterable[str] = (),
+        disabled: Iterable[str | ModelRoute] = (),
     ) -> None:
         self._providers: Mapping[str, Provider] = MappingProxyType(dict(providers))
         owned = {id(provider) for provider in self._providers.values()}
+
+        def check_owned(route: ModelRoute) -> None:
+            if id(route.provider) not in owned:
+                raise ValueError(f"model {route.public_id!r} uses a provider this registry does not own")
+
         by_id: dict[str, ModelRoute] = {}
         for route in routes:
             if route.public_id in by_id:
                 raise ValueError(f"duplicate public model ID {route.public_id!r}")
-            if id(route.provider) not in owned:
-                raise ValueError(f"model {route.public_id!r} uses a provider this registry does not own")
+            check_owned(route)
             by_id[route.public_id] = route
         self._routes: Mapping[str, ModelRoute] = MappingProxyType(by_id)
-        self._disabled = frozenset(disabled)
+
+        disabled_routes: dict[str, ModelRoute] = {}
+        disabled_ids: set[str] = set()
+        for item in disabled:
+            if isinstance(item, ModelRoute):
+                check_owned(item)
+                disabled_routes[item.public_id] = item
+                disabled_ids.add(item.public_id)
+            else:
+                disabled_ids.add(item)
+        self._disabled = frozenset(disabled_ids)
+        self._disabled_routes: Mapping[str, ModelRoute] = MappingProxyType(disabled_routes)
         if self._disabled & by_id.keys():
             raise ValueError("a model cannot be both enabled and disabled")
 
@@ -173,6 +189,15 @@ class ModelRegistry:
     def enabled_models(self) -> list[ModelRoute]:
         """Enabled routes, sorted by public ID so listings are stable."""
         return sorted(self._routes.values(), key=lambda route: route.public_id)
+
+    def disabled_models(self) -> list[ModelRoute]:
+        """Routes of disabled models, sorted by public ID. Never used for requests."""
+        return sorted(self._disabled_routes.values(), key=lambda route: route.public_id)
+
+    @property
+    def providers(self) -> Mapping[str, Provider]:
+        """Every provider instance by name (read-only), including ones only disabled models use."""
+        return self._providers
 
     async def aclose(self) -> None:
         """Close every provider. One failing close is logged and doesn't stop the others."""
@@ -257,13 +282,13 @@ def build_registry(config: RegistryConfig, environ: Mapping[str, str]) -> ModelR
         name: create_provider(name, provider_config, api_key=api_keys.get(name))
         for name, provider_config in config.providers.items()
     }
-    routes = [
-        ModelRoute(public_id, providers[model.provider], model.provider_model_id)
+    routes = {
+        public_id: ModelRoute(public_id, providers[model.provider], model.provider_model_id)
         for public_id, model in config.models.items()
-        if model.enabled
-    ]
-    disabled = [public_id for public_id, model in config.models.items() if not model.enabled]
-    return ModelRegistry(providers, routes, disabled)
+    }
+    enabled = [routes[public_id] for public_id, model in config.models.items() if model.enabled]
+    disabled = [routes[public_id] for public_id, model in config.models.items() if not model.enabled]
+    return ModelRegistry(providers, enabled, disabled)
 
 
 def load_registry(path: Path, environ: Mapping[str, str]) -> ModelRegistry:

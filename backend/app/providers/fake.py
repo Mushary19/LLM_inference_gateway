@@ -64,6 +64,8 @@ class FakeProvider:
         yield ChatChunk(delta="", finish_reason=finish_reason, usage=self._usage(request, words))
 
     async def list_models(self) -> list[ModelInfo]:
+        if self.fail_with is not None:  # consistent with health(): a failing provider can't list
+            raise self.fail_with
         return [ModelInfo(id=model, owned_by=self.name) for model in self.models]
 
     async def health(self) -> HealthStatus:

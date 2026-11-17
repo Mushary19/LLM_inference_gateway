@@ -133,15 +133,15 @@ class OpenAICompatibleProvider:
         # model already ran, so it is treated as possibly consuming tokens.
         consumed = status >= 500
         if status == 404 or code == "model_not_found":
-            return ModelNotFoundError(detail)
+            return ModelNotFoundError(detail, status_code=status)
         if status in _TIMEOUT_STATUSES:
-            return ProviderTimeoutError(detail, may_have_consumed_tokens=consumed)
+            return ProviderTimeoutError(detail, may_have_consumed_tokens=consumed, status_code=status)
         if status in _UNAVAILABLE_STATUSES:
-            return ProviderUnavailableError(detail, may_have_consumed_tokens=consumed)
+            return ProviderUnavailableError(detail, may_have_consumed_tokens=consumed, status_code=status)
         if status in (400, 413, 422):
-            return InvalidProviderRequestError(detail)
+            return InvalidProviderRequestError(detail, status_code=status)
         # 401/403 (gateway misconfigured), other 4xx and 5xx: the gateway can't fix these.
-        return ProviderError(detail, may_have_consumed_tokens=consumed)
+        return ProviderError(detail, may_have_consumed_tokens=consumed, status_code=status)
 
     @staticmethod
     def _parse_chat_response(body: Any, requested_model: str) -> ChatResponse:

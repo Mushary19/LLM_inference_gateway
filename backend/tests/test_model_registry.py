@@ -583,3 +583,45 @@ def test_registry_path_resolution(value, expected):
     configured = Settings(database_url=settings.database_url, model_registry_file=value)
 
     assert configured.model_registry_file == (None if expected is None else type(BACKEND_DIR)(expected))
+
+
+# --- Read access for diagnostics ---
+
+
+def test_disabled_routes_are_kept_for_diagnostics_but_never_resolved():
+    registry = build(VALID)
+    try:
+        [disabled] = registry.disabled_models()
+        assert (disabled.public_id, disabled.provider.name, disabled.provider_model_id) == ("qwen-local", "ollama", "qwen2.5:7b")
+        with pytest.raises(UnknownModelError) as excinfo:
+            registry.resolve("qwen-local")
+        assert excinfo.value.disabled
+        assert "qwen-local" not in [r.public_id for r in registry.enabled_models()]
+    finally:
+        close(registry)
+
+
+def test_providers_accessor_is_read_only_and_includes_every_instance():
+    registry = build(VALID)
+    try:
+        assert sorted(registry.providers) == ["fake", "groq", "ollama"]  # ollama serves only a disabled model
+        with pytest.raises(TypeError):
+            registry.providers["new"] = FakeProvider()
+    finally:
+        close(registry)
+
+
+def test_disabled_models_may_still_be_given_as_ids():
+    provider = FakeProvider()
+    registry = ModelRegistry({"fake": provider}, [ModelRoute(FAKE_MODEL, provider, FAKE_MODEL)], disabled=["old"])
+
+    with pytest.raises(UnknownModelError) as excinfo:
+        registry.resolve("old")
+    assert excinfo.value.disabled and registry.disabled_models() == []
+
+
+def test_disabled_routes_must_use_owned_providers():
+    owned, foreign = FakeProvider(name="owned"), FakeProvider(name="foreign")
+
+    with pytest.raises(ValueError, match="does not own"):
+        ModelRegistry({"owned": owned}, [], disabled=[ModelRoute("m", foreign, "x")])

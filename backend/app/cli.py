@@ -7,12 +7,16 @@
     python -m app.cli set-quota --app <name> --limit N
     python -m app.cli show-quota --app <name>
     python -m app.cli expire-reservations [--older-than-minutes M]
+    python -m app.cli check-providers [--timeout SECONDS] [--json]
 
 Uses the application's DATABASE_URL. Plaintext keys are printed once, by create-key, and
-are never stored or shown again.
+are never stored or shown again. check-providers needs no database: it loads the model
+registry the server would load and probes each provider once (GET /models, no inference).
 """
 
 import argparse
+import asyncio
+import json
 import sys
 from collections.abc import Callable, Sequence
 from datetime import timedelta
@@ -23,8 +27,13 @@ from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.database.models import TokenQuota
+from app.providers.registry import RegistryConfigError, registry_from_settings
 from app.services import api_keys, quota
+from app.services.provider_health import DEFAULT_PROBE_TIMEOUT_SECONDS, HealthReport, check_registry
+
+MAX_PROBE_TIMEOUT_SECONDS = 300.0
 
 
 def _create_app(session: Session, args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
@@ -153,8 +162,97 @@ def _expire_reservations(session: Session, args: argparse.Namespace, out: TextIO
     return 0
 
 
+def _probe_timeout(value: str) -> float:
+    try:
+        seconds = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a number of seconds") from None
+    if not 0 < seconds <= MAX_PROBE_TIMEOUT_SECONDS:
+        raise argparse.ArgumentTypeError(f"must be > 0 and <= {MAX_PROBE_TIMEOUT_SECONDS:g}")
+    return seconds
+
+
+async def _run_checks(timeout: float) -> HealthReport:
+    # Built inside the event loop that uses and closes it.
+    registry = registry_from_settings(settings)
+    try:
+        return await check_registry(registry, timeout)
+    finally:
+        await registry.aclose()  # closes every provider, even if checking failed
+
+
+def _report_as_json(report: HealthReport, source: str | None) -> str:
+    return json.dumps(
+        {
+            "registry": source,
+            "ok": report.ok,
+            "providers": [
+                {"name": c.name, "status": c.status, "reason": c.reason, "latency_ms": c.latency_ms}
+                for c in report.providers
+            ],
+            "models": [
+                {
+                    "id": m.public_id,
+                    "provider": m.provider,
+                    "provider_model_id": m.provider_model_id,
+                    "enabled": m.enabled,
+                    "availability": m.availability,
+                }
+                for m in report.models
+            ],
+            "problems": report.problems,
+        },
+        indent=2,
+    )
+
+
+def _table(headers: list[str], rows: list[list[str]]) -> list[str]:
+    widths = [max(len(cell) for cell in column) for column in zip(headers, *rows)]
+    return ["  ".join(cell.ljust(width) for cell, width in zip(row, widths)).rstrip() for row in [headers, *rows]]
+
+
+def _report_as_text(report: HealthReport, source: str | None) -> str:
+    lines = [
+        f"Registry: {source}" if source else "Registry: built-in default (MODEL_REGISTRY_FILE is not set)",
+        "(the configuration on disk now; a running server uses what it loaded at startup)",
+        "",
+    ]
+    lines += _table(
+        ["PROVIDER", "STATUS", "REASON", "LATENCY"],
+        [[c.name, c.status, c.reason or "-", f"{c.latency_ms:.0f} ms"] for c in report.providers],
+    )
+    lines.append("")
+    lines += _table(
+        ["MODEL", "PROVIDER", "UPSTREAM MODEL", "ENABLED", "AVAILABILITY"],
+        [
+            [m.public_id, m.provider, m.provider_model_id, "yes" if m.enabled else "no", m.availability]
+            for m in report.models
+        ],
+    )
+    lines += [
+        "",
+        "healthy = reachable and authenticated; it doesn't guarantee inference succeeds.",
+        "not_listed = absent from the provider's model list; requests may still work (aliases, tags).",
+        "unknown = the provider couldn't be checked, so nothing is known about its models.",
+        "",
+    ]
+    lines += ["Problems:", *(f"  {problem}" for problem in report.problems)] if report.problems else ["No problems found."]
+    return "\n".join(lines)
+
+
+def _check_providers(args: argparse.Namespace, out: TextIO, err: TextIO) -> int:
+    try:
+        report = asyncio.run(_run_checks(args.timeout))
+    except RegistryConfigError as exc:
+        print(f"Model registry configuration error: {exc}", file=err)
+        return 2
+    source = str(settings.model_registry_file) if settings.model_registry_file else None
+    print(_report_as_json(report, source) if args.json else _report_as_text(report, source), file=out)
+    return 0 if report.ok else 1
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m app.cli", description="Manage InferenceFlow API keys.")
+    parser = argparse.ArgumentParser(prog="python -m app.cli", description="Manage InferenceFlow API keys, quotas and provider checks.")
     commands = parser.add_subparsers(dest="command", required=True)
 
     create_app = commands.add_parser("create-app", help="register a client application")
@@ -192,6 +290,19 @@ def _parser() -> argparse.ArgumentParser:
         help="only reservations older than this (keep it well above the provider timeout; default 60)",
     )
     expire.set_defaults(handler=_expire_reservations)
+
+    check = commands.add_parser(
+        "check-providers",
+        help="check provider health and model availability (one GET /models per provider; no inference)",
+    )
+    check.add_argument(
+        "--timeout", type=_probe_timeout, default=DEFAULT_PROBE_TIMEOUT_SECONDS,
+        help=f"per-provider probe timeout in seconds, independent of inference timeouts "
+        f"(default {DEFAULT_PROBE_TIMEOUT_SECONDS:g})",
+    )
+    check.add_argument("--json", action="store_true", help="print the report as JSON")
+    # Exit status: 0 all healthy and listed, 1 problems found, 2 invalid registry configuration.
+    check.set_defaults(handler=_check_providers, needs_session=False)
     return parser
 
 
@@ -202,6 +313,8 @@ def main(
     err: TextIO = sys.stderr,
 ) -> int:
     args = _parser().parse_args(argv)
+    if not getattr(args, "needs_session", True):
+        return args.handler(args, out, err)  # never opens a database session
     if session_scope is None:
         from app.database.connection import SessionLocal
 

@@ -558,3 +558,34 @@ def test_upstream_400_keeps_a_useful_sanitized_message(client_with_upstream, cap
     }
     assert UPSTREAM_ID in caplog.text  # the server log keeps the original
     assert SECRET not in caplog.text
+
+
+# --- HTTP status is kept on errors (used by provider diagnostics) ---
+
+
+@pytest.mark.parametrize("status", [400, 401, 403, 404, 408, 413, 418, 422, 429, 500, 502, 503, 504])
+def test_http_errors_carry_the_status_code(status):
+    upstream = Upstream(httpx.Response(status, json={"error": {"message": "no"}}))
+
+    with pytest.raises(ProviderError) as excinfo:
+        run(chat_once(make_provider(upstream), chat_request()))
+
+    assert excinfo.value.status_code == status
+
+
+@pytest.mark.parametrize(
+    "upstream",
+    [Upstream(raises=httpx.ConnectError("refused")), Upstream(raises=httpx.ReadTimeout("slow")), Upstream(httpx.Response(200, text="garbage"))],
+    ids=["transport", "timeout", "unreadable"],
+)
+def test_non_http_errors_have_no_status_code(upstream):
+    with pytest.raises(ProviderError) as excinfo:
+        run(chat_once(make_provider(upstream), chat_request()))
+
+    assert excinfo.value.status_code is None
+
+
+def test_status_code_is_optional_for_existing_callers():
+    error = ProviderUnavailableError("down", may_have_consumed_tokens=False)
+
+    assert error.status_code is None and error.may_have_consumed_tokens is False

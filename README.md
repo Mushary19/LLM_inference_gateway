@@ -403,6 +403,134 @@ OPENAI_COMPATIBLE_TIMEOUT_SECONDS=120
 
 If `MODEL_REGISTRY_FILE` is set, `CHAT_PROVIDER` is ignored, with a warning in the log.
 
+## Health checks
+
+Three separate questions, answered separately:
+
+| Question | Answered by | Checks |
+|---|---|---|
+| Is the API process up? (**application liveness**) | `GET /health` | nothing else |
+| Can we reach this provider, and does it accept our key? (**provider health**) | `python -m app.cli check-providers` | one `GET /models` per provider |
+| Does that provider list the model ID a route uses? (**model availability**) | the same command | the same listing |
+
+A provider can be healthy while one of its registered models is missing or misconfigured. A
+provider that can't be checked tells us nothing about its models, so they are reported as
+`unknown`, not as missing.
+
+### `GET /health`
+
+```bash
+curl localhost:8000/health
+# {"status": "ok"}
+```
+
+- No API key needed, and not rate-limited.
+- It checks **no** dependencies (database, Redis or providers), so an orchestrator never restarts
+  a working gateway because an upstream provider is down.
+
+### `check-providers`
+
+```bash
+cd backend
+python -m app.cli check-providers                # text report
+python -m app.cli check-providers --json         # for scripts and monitoring
+python -m app.cli check-providers --timeout 2    # per-provider probe timeout (default 5 s)
+```
+
+```
+Registry: /…/backend/models.json
+(the configuration on disk now; a running server uses what it loaded at startup)
+
+PROVIDER  STATUS     REASON             LATENCY
+fake      healthy    -                  0 ms
+groq      healthy    -                  184 ms
+ollama    unhealthy  connection_failed  2 ms
+
+MODEL          PROVIDER  UPSTREAM MODEL           ENABLED  AVAILABILITY
+fake-model     fake      fake-model               yes      listed
+llama-3.1-8b   groq      llama-3.1-8b-instnt      yes      not_listed
+llama-3.3-70b  groq      llama-3.3-70b-versatile  yes      listed
+qwen-local     ollama    qwen2.5:7b               no       unknown
+
+Problems:
+  provider ollama is unhealthy (connection_failed)
+  enabled model llama-3.1-8b is not_listed on provider groq
+```
+
+**Exit status:**
+
+| Code | Meaning |
+|---|---|
+| `0` | every provider healthy and every enabled model listed |
+| `1` | problems found (disabled models are reported but never count as problems) |
+| `2` | invalid registry configuration |
+
+**What the command does:**
+- It loads the registry exactly as the server would: the same file, environment variables and
+  validation.
+- It probes all providers **concurrently**, **once each**, so a run takes at most about one
+  timeout.
+- It **never** runs inference, needs no database, and doesn't touch quotas, usage or Redis.
+- It closes every provider afterwards, even if a check fails.
+
+**Timeouts:** `--timeout` bounds each probe on its own. It doesn't use or change the provider's
+inference `timeout_seconds`. A probe that times out is cancelled, and its connection released.
+
+**Provider status:**
+
+| Status | Reason | Meaning |
+|---|---|---|
+| `healthy` | - | the model listing was returned |
+| `unhealthy` | `connection_failed` | DNS, TLS, refused or reset connection |
+| | `timeout` | no answer within `--timeout`, or upstream 408/504 |
+| | `authentication_failed` | 401/403: wrong or missing key |
+| | `rate_limited` | 429 |
+| | `server_error` | other 5xx |
+| | `request_rejected` | 400 |
+| | `unexpected_status` | any other unclassified status |
+| | `invalid_response` | the answer isn't a readable model list |
+| | `probe_error` | an unexpected error inside the check; the other providers are still checked |
+| `unverified` | `listing_not_supported` | the server answered 404 on `/models`; some OpenAI-compatible servers don't implement it |
+
+**Model availability:**
+
+| Value | Meaning |
+|---|---|
+| `listed` | the provider's model list contains the route's `provider_model_id` |
+| `not_listed` | it doesn't, which usually means a typo or a model that hasn't been pulled |
+| `unknown` | the provider couldn't be checked |
+
+### What the check can't tell you
+
+- **`healthy` doesn't mean inference will succeed.** It means the provider is reachable and
+  accepted our key. Chat can still fail, for example on exhausted upstream token quotas or
+  overloaded GPUs.
+- **`not_listed` doesn't prove a model is unusable.** Matching is exact, and listings may omit
+  aliases. For example, Ollama lists `qwen2.5:latest` but also serves `qwen2.5`. Nothing is
+  auto-corrected.
+- **It checks from the machine it runs on, using the config on disk.** Run it where the server
+  runs (for example, `docker exec … python -m app.cli check-providers`). Remember that a running
+  server keeps the registry it loaded at startup.
+
+### Security
+
+- Reports contain fixed codes only. They never contain upstream messages, base URLs, keys or
+  environment values.
+- Upstream error details are logged at DEBUG level only.
+- `provider_model_id` is shown, because the operator needs it to fix a `not_listed` model and
+  already has it in `models.json`.
+
+### Not included
+
+- There is no background monitoring, cached health state or health-based routing: a request is
+  never rejected because of an earlier check. Requests to a down provider fail as before (503 or
+  504).
+- There is no circuit breaker, failover or load balancing.
+- There is no HTTP diagnostics endpoint. Client API keys aren't admin credentials, so provider
+  details stay behind shell access.
+- Each probe is one `GET /models`, which is free on hosted APIs but may count toward their
+  request rate limits. Don't run it in a tight loop.
+
 ## API key authentication
 
 The gateway endpoints require an API key:
