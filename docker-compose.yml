@@ -12,5 +12,58 @@ services:
       - postgres_data:/var/lib/postgresql/data
     restart: unless-stopped
 
+  # Dedicated database for automated tests (pytest). Never point the app at it.
+  test-db:
+    image: postgres:17
+    container_name: inferenceflow-test-db
+    environment:
+      POSTGRES_DB: inferenceflow_test
+      POSTGRES_USER: inferenceflow_test
+      POSTGRES_PASSWORD: test-only-password # local test database only
+    ports:
+      - "15432:5432"
+    volumes:
+      - test_postgres_data:/var/lib/postgresql/data
+      # Sets the identity marker pytest checks for; runs only on a fresh volume.
+      - ./docker/test-db/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U inferenceflow_test -d inferenceflow_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  # Rate-limit state for the host-run backend (REDIS_URL=redis://localhost:16379/0).
+  # Short-lived state only, so nothing is persisted.
+  redis:
+    image: redis:8
+    container_name: inferenceflow-redis
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "16379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+    restart: unless-stopped
+
+  # Dedicated Redis for automated tests (TEST_REDIS_URL). Never point the app at it.
+  test-redis:
+    image: redis:8
+    container_name: inferenceflow-test-redis
+    # Starts Redis and sets the identity marker pytest checks for.
+    command: ["sh", "/usr/local/bin/inferenceflow-test-redis-start.sh"]
+    ports:
+      - "16380:6379"
+    volumes:
+      - ./docker/test-redis/start.sh:/usr/local/bin/inferenceflow-test-redis-start.sh:ro
+    healthcheck:
+      # Healthy only once the identity marker is in place.
+      test: ["CMD-SHELL", "redis-cli get inferenceflow:test-redis:identity | grep -qx inferenceflow-test-redis"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
 volumes:
   postgres_data:
+  test_postgres_data:

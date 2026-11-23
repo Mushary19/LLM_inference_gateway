@@ -1,15 +1,20 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/.env, resolved from this file so it loads regardless of the working directory.
-ENV_FILE = Path(__file__).resolve().parents[2] / ".env"
+BACKEND_DIR = Path(__file__).resolve().parents[2]
+ENV_FILE = BACKEND_DIR / ".env"
+
+METRICS_TOKEN_MIN_LENGTH = 32
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
+    # hide_input_in_errors: a rejected value (e.g. a too-short METRICS_TOKEN, or a DATABASE_URL
+    # with a password) is never echoed in the startup error.
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore", hide_input_in_errors=True)
 
     database_url: str
 
@@ -42,6 +47,77 @@ class Settings(BaseSettings):
     max_generation_tokens: int = Field(default=512, gt=0)
     # Simultaneous model.generate() calls in the Hugging Face engine.
     inference_max_concurrency: int = Field(default=1, gt=0)
+
+    # Model registry behind POST /v1/chat/completions and GET /v1/models: a JSON file mapping
+    # public model IDs to provider instances (see models.example.json). A relative path is
+    # resolved against the backend directory (where .env lives), not the working directory.
+    # Unset: a built-in registry with only the fake provider and its model "fake-model".
+    model_registry_file: Path | None = None
+
+    # Legacy, replaced by model_registry_file. Kept only so a deployment still configured with
+    # CHAT_PROVIDER=openai_compatible fails at startup instead of silently serving fake output.
+    chat_provider: str = "fake"
+
+    # Per-API-key rate limiting (token bucket in Redis). The default URL is the docker-compose
+    # "redis" service as seen from the host-run backend; inside Compose use redis://redis:6379/0.
+    redis_url: str = "redis://localhost:16379/0"
+    # Connect and per-command timeout. If Redis can't answer in time, /v1 requests get 503.
+    redis_timeout_seconds: float = Field(default=0.5, gt=0)
+    rate_limit_requests_per_minute: int = Field(default=60, gt=0)  # sustained refill rate
+    rate_limit_burst: int = Field(default=10, gt=0)  # bucket capacity
+
+    # Logging of the application's own loggers (see app/core/structured_logging.py). json: one
+    # JSON object per line; text: readable lines for local development.
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    log_format: Literal["json", "text"] = "json"
+
+    # Bearer token for GET /metrics (Prometheus scraping). Unset or empty: the endpoint is
+    # disabled and answers 404. When set it must be at least METRICS_TOKEN_MIN_LENGTH
+    # characters (surrounding whitespace is ignored). Never logged; masked in reprs.
+    metrics_token: SecretStr | None = None
+
+    # Token quota given to applications created without an explicit --token-limit.
+    # A quota is a lifetime allowance: it never resets automatically.
+    default_token_quota: int = Field(default=1_000_000, ge=0)
+
+    @field_validator("log_level", "log_format", mode="before")
+    @classmethod
+    def _case_insensitive(cls, value: object, info) -> object:
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        return value.upper() if info.field_name == "log_level" else value.lower()
+
+    @field_validator("metrics_token", mode="before")
+    @classmethod
+    def _empty_metrics_token_is_unset(cls, value: object) -> object:
+        if isinstance(value, SecretStr):
+            value = value.get_secret_value()
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+    @field_validator("metrics_token")
+    @classmethod
+    def _metrics_token_is_strong_enough(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) < METRICS_TOKEN_MIN_LENGTH:
+            # The message never includes the value (and hide_input_in_errors drops the input).
+            raise ValueError(f"METRICS_TOKEN must be at least {METRICS_TOKEN_MIN_LENGTH} characters")
+        return value
+
+    @field_validator("model_registry_file", mode="before")
+    @classmethod
+    def _empty_registry_file_is_unset(cls, value: object) -> object:
+        return None if isinstance(value, str) and not value.strip() else value
+
+    @field_validator("model_registry_file")
+    @classmethod
+    def _resolve_registry_file(cls, value: Path | None) -> Path | None:
+        if value is None:
+            return None
+        value = value.expanduser()
+        return value if value.is_absolute() else BACKEND_DIR / value
 
     @model_validator(mode="after")
     def _check_gpu_memory(self) -> "Settings":

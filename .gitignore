@@ -8,6 +8,9 @@ venv/
 .env.*
 !.env.example
 
+# Model registry used at runtime (backend/models.example.json is the committed template)
+backend/models.json
+
 # Python cache
 __pycache__/
 *.py[cod]
