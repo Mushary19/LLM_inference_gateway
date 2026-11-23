@@ -1,16 +1,20 @@
 from pathlib import Path
 from typing import Literal
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # backend/.env, resolved from this file so it loads regardless of the working directory.
 BACKEND_DIR = Path(__file__).resolve().parents[2]
 ENV_FILE = BACKEND_DIR / ".env"
 
+METRICS_TOKEN_MIN_LENGTH = 32
+
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore")
+    # hide_input_in_errors: a rejected value (e.g. a too-short METRICS_TOKEN, or a DATABASE_URL
+    # with a password) is never echoed in the startup error.
+    model_config = SettingsConfigDict(env_file=ENV_FILE, extra="ignore", hide_input_in_errors=True)
 
     database_url: str
 
@@ -67,6 +71,11 @@ class Settings(BaseSettings):
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
     log_format: Literal["json", "text"] = "json"
 
+    # Bearer token for GET /metrics (Prometheus scraping). Unset or empty: the endpoint is
+    # disabled and answers 404. When set it must be at least METRICS_TOKEN_MIN_LENGTH
+    # characters (surrounding whitespace is ignored). Never logged; masked in reprs.
+    metrics_token: SecretStr | None = None
+
     # Token quota given to applications created without an explicit --token-limit.
     # A quota is a lifetime allowance: it never resets automatically.
     default_token_quota: int = Field(default=1_000_000, ge=0)
@@ -78,6 +87,24 @@ class Settings(BaseSettings):
             return value
         value = value.strip()
         return value.upper() if info.field_name == "log_level" else value.lower()
+
+    @field_validator("metrics_token", mode="before")
+    @classmethod
+    def _empty_metrics_token_is_unset(cls, value: object) -> object:
+        if isinstance(value, SecretStr):
+            value = value.get_secret_value()
+        if isinstance(value, str):
+            value = value.strip()
+            return value or None
+        return value
+
+    @field_validator("metrics_token")
+    @classmethod
+    def _metrics_token_is_strong_enough(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and len(value.get_secret_value()) < METRICS_TOKEN_MIN_LENGTH:
+            # The message never includes the value (and hide_input_in_errors drops the input).
+            raise ValueError(f"METRICS_TOKEN must be at least {METRICS_TOKEN_MIN_LENGTH} characters")
+        return value
 
     @field_validator("model_registry_file", mode="before")
     @classmethod

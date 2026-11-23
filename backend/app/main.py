@@ -8,10 +8,12 @@ from starlette.types import ASGIApp
 
 from app.api import chat, usage  # noqa: F401  (register their routes on the /v1 router)
 from app.api.health import router as health_router
+from app.api.metrics import router as metrics_router
 from app.api.middleware import RequestContextMiddleware
 from app.api.routes import router
 from app.api.v1 import router as v1_router
 from app.core.config import settings
+from app.core.metrics import GatewayMetrics
 from app.core.structured_logging import configure_logging
 from app.database.connection import SessionLocal
 from app.providers.registry import registry_from_settings
@@ -108,7 +110,14 @@ class InferenceFlowApp(FastAPI):
     app.add_middleware() would place it inside ServerErrorMiddleware, which sends the 500
     for an unhandled exception straight to the server, so that response would lack
     X-Request-ID. Outermost, every response, that 500 included, passes through it.
+
+    Each instance also gets its own metrics registry (app.state.metrics, see
+    app/core/metrics.py), so two instances in one process never share or collide.
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.state.metrics = GatewayMetrics()
 
     def build_middleware_stack(self) -> ASGIApp:
         return RequestContextMiddleware(super().build_middleware_stack())
@@ -116,5 +125,6 @@ class InferenceFlowApp(FastAPI):
 
 app = InferenceFlowApp(title="InferenceFlow", lifespan=lifespan)
 app.include_router(health_router)
+app.include_router(metrics_router)
 app.include_router(router)
 app.include_router(v1_router)

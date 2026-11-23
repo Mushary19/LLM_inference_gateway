@@ -1134,6 +1134,67 @@ status. A client still gets the sanitized message of a provider 400 (see "Model 
   the root logger no handler, so nothing prints twice. With a custom `--log-config` that does,
   exclude the `app` loggers there.
 
+## Metrics
+
+`GET /metrics` serves the gateway's metrics in the Prometheus text format, for a Prometheus
+server to scrape. It is the foundation for the operational metrics added in the next steps;
+no gateway metrics are recorded yet, so a scrape currently returns an empty body.
+
+### Enable it
+
+The endpoint is **disabled by default**: without `METRICS_TOKEN` it answers `404`, like an
+unknown path. To enable it, set a token of at least 32 characters (surrounding whitespace is
+ignored; an empty value means disabled):
+
+```bash
+python -c "import secrets; print(secrets.token_urlsafe(32))"   # then, in .env:
+METRICS_TOKEN=<that value>
+```
+
+A shorter token stops the application at startup with
+`METRICS_TOKEN must be at least 32 characters`. The error never shows the value.
+
+### Scrape it
+
+Requests must send `Authorization: Bearer <METRICS_TOKEN>`. Anything else (no header, another
+scheme, a wrong token, an API key) gets `401` and no metrics. The token is compared in constant
+time and never logged.
+
+```bash
+curl -H "Authorization: Bearer $METRICS_TOKEN" http://localhost:8000/metrics
+```
+
+A Prometheus scrape configuration, with the token in a file readable only by Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: inferenceflow
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/inferenceflow_metrics_token
+    static_configs:
+      - targets: ["inferenceflow-host:8000"]
+```
+
+### What a scrape does (and doesn't)
+
+- It only reads values held in the gateway process. It never contacts a provider, PostgreSQL
+  or Redis.
+- It isn't part of the gateway API. It isn't under `/v1`, so it uses no API key, rate limit or
+  token quota. It isn't in the OpenAPI schema (`/docs`), and it isn't listed by `/v1/models`.
+- Like every response, it carries `X-Request-ID` and is logged as `http_request_finished`.
+
+### Limitations
+
+- Metric values live in the gateway process: they start from zero when it restarts. Prometheus
+  handles counter resets.
+- One process per scrape target. The gateway runs as a single uvicorn process (the Dockerfile
+  starts no extra workers). With several worker processes, each would keep its own values and
+  a scrape would see only one of them. Run more instances as separate targets instead.
+- Treat the endpoint as operational data. Even with the token, don't expose it to the public
+  internet; restrict it to the network Prometheus scrapes from.
+
 ## Testing
 
 Automated tests run against their own PostgreSQL container, `test-db`, and never touch the

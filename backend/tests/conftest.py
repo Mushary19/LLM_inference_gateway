@@ -46,6 +46,7 @@ from sqlalchemy.orm import Session  # noqa: E402
 
 from app.api.chat import get_model_registry  # noqa: E402
 from app.core.config import settings  # noqa: E402
+from app.core.metrics import GatewayMetrics  # noqa: E402
 from app.database.base import Base  # noqa: E402
 from app.database.connection import engine, get_db  # noqa: E402
 from app.database.models import ApiKey, ClientApplication, QuotaReservation, UsageRecord  # noqa: E402
@@ -144,6 +145,21 @@ def scheduler_disabled(monkeypatch):
 def simulated_inference_engine(monkeypatch):
     """Never load a real model in tests, even if .env sets INFERENCE_ENGINE=huggingface."""
     monkeypatch.setattr(settings, "inference_engine", "simulated")
+
+
+@pytest.fixture(autouse=True)
+def isolated_metrics(monkeypatch):
+    """Every test starts with a fresh, empty metrics registry on the app (nothing leaks
+    between tests), and /metrics disabled whatever .env says (tests enable it explicitly)."""
+    # Not monkeypatch.setattr: Starlette's State keeps attributes in a dict, which monkeypatch
+    # would delete instead of restoring.
+    original = app.state.metrics
+    app.state.metrics = GatewayMetrics()
+    monkeypatch.setattr(settings, "metrics_token", None)
+    try:
+        yield app.state.metrics
+    finally:
+        app.state.metrics = original
 
 
 @pytest.fixture(autouse=True)
