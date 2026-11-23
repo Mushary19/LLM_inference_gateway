@@ -44,7 +44,12 @@ class ChatResponse:
 
 @dataclass(frozen=True)
 class ChatChunk:
-    """One streamed piece of a response. The final chunk carries finish_reason and usage."""
+    """One streamed piece of a response.
+
+    Content chunks have finish_reason=None. The terminal chunk (exactly one, last) has
+    finish_reason set and carries usage, or None when the provider didn't report it. An
+    empty delta with no finish_reason carries nothing (see Provider.stream).
+    """
 
     delta: str
     finish_reason: FinishReason | None = None
@@ -119,7 +124,22 @@ class Provider(Protocol):
     async def chat(self, request: ChatRequest) -> ChatResponse: ...
 
     def stream(self, request: ChatRequest) -> AsyncIterator[ChatChunk]:
-        """Implemented as an async generator: `async for chunk in provider.stream(request)`."""
+        """Implemented as an async generator: `async for chunk in provider.stream(request)`.
+
+        Contract (the gateway relies on it, see app/api/chat_stream.py):
+        - Zero or more content chunks, then exactly one terminal chunk (finish_reason set).
+          Ending without a terminal chunk means the stream is incomplete, never a success.
+        - The first item may be an empty "accepted" chunk, yielded as soon as the provider
+          has accepted the request and before any content. The gateway waits only for the
+          first item before it starts the HTTP response, so failures raised before it are
+          returned as ordinary HTTP errors.
+        - Every failure is raised as a ProviderError; failures after the first item set
+          may_have_consumed_tokens=True.
+        - Closing the generator early (aclose() or cancellation) releases the upstream
+          request and its connection.
+        - No cancel scope may stay open across a yield: the gateway starts the generator in
+          one task and continues or closes it in another.
+        """
         ...
 
     async def list_models(self) -> list[ModelInfo]: ...

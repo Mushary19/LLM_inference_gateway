@@ -327,17 +327,7 @@ def test_health_reports_unreachable_provider():
     assert not health.healthy and "could not reach provider" in health.detail
 
 
-def test_stream_is_not_implemented_yet():
-    provider = make_provider(Upstream())
-
-    async def scenario():
-        try:
-            return [chunk async for chunk in provider.stream(chat_request())]
-        finally:
-            await provider.aclose()
-
-    with pytest.raises(NotImplementedError):
-        run(scenario())
+# Streaming is tested in test_openai_compatible_streaming.py.
 
 
 # --- Factory and application wiring ---

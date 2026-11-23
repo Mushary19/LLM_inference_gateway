@@ -119,7 +119,9 @@ def test_unknown_request_fields_are_ignored_for_sdk_compatibility(client):
         {**BODY, "temperature": -0.1},
         {**BODY, "top_p": 0},
         {**BODY, "top_p": 1.5},
-        {**BODY, "stream": True},
+        {**BODY, "stream": True, "stream_options": "yes"},
+        {**BODY, "stream": True, "stream_options": {"include_usage": "maybe"}},
+        {**BODY, "stream": "sometimes"},
     ],
 )
 def test_invalid_requests_are_rejected(client, body):
@@ -134,10 +136,20 @@ def test_max_tokens_above_the_generation_limit_is_rejected(client):
     assert above.status_code == 422
 
 
-def test_streaming_request_gets_a_clear_message(client):
+def test_streaming_requests_are_accepted(client):
+    """Streaming itself is tested in test_chat_streaming.py."""
     response = client.post(URL, json={**BODY, "stream": True})
 
-    assert "streaming is not supported yet" in response.text
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert response.text.endswith("data: [DONE]\n\n")
+
+
+def test_stream_options_are_ignored_without_streaming(client):
+    response = client.post(URL, json={**BODY, "stream_options": {"include_usage": True}})
+
+    assert response.status_code == 200
+    assert response.json()["object"] == "chat.completion"
 
 
 # --- Provider failures ---

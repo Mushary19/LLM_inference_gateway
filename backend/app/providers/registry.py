@@ -13,7 +13,8 @@ Configuration format (see models.example.json):
 
     {
       "providers": {"<provider name>": {"type": "openai_compatible", "base_url": "...",
-                                        "api_key_env": "...", "timeout_seconds": 60},
+                                        "api_key_env": "...", "timeout_seconds": 60,
+                                        "stream_usage": false},
                     "<provider name>": {"type": "fake"}},
       "models":    {"<public model ID>": {"provider": "<provider name>",
                                           "provider_model_id": "...", "enabled": true}}
@@ -83,8 +84,13 @@ class OpenAICompatibleProviderConfig(_StrictModel):
     base_url: str
     # Name of the environment variable holding the bearer token, if the server needs one.
     api_key_env: EnvVarName | None = None
-    # Covers the whole request, including generation.
+    # Covers the whole request, including generation (for streams: the whole stream).
     timeout_seconds: float = Field(default=60.0, gt=0, allow_inf_nan=False)
+    # Ask the server for token usage on streamed responses (stream_options.include_usage).
+    # Off by default because not every OpenAI-compatible server accepts that option; without
+    # it, streams from servers that only report usage on request are charged the full
+    # reservation. Enable it only after verifying the server supports it.
+    stream_usage: bool = False
 
     @field_validator("base_url")
     @classmethod

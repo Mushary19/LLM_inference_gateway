@@ -10,19 +10,25 @@ Routing: the request's public model ID is resolved in the model registry
 (app/providers/registry.py) to a provider instance and that provider's own model ID. Clients
 only ever see public IDs. Provider-specific model IDs, provider URLs and upstream error
 details stay in the server logs.
+
+Streaming ("stream": true) shares everything up to and including the quota reservation; the
+streamed response and its settlement are in app/api/chat_stream.py.
 """
 
 import logging
 import re
 import time
 import uuid
+from functools import partial
 
-from fastapi import Depends, HTTPException, Request, status
+import anyio
+from fastapi import Depends, HTTPException, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.api.auth import AuthenticatedClient, require_api_key
+from app.api.chat_stream import GatewayStreamingResponse, StreamSettlement, sse_events, stream_meta
 from app.api.v1 import router
 from app.core.config import settings
 from app.database.connection import get_db
@@ -196,13 +202,65 @@ async def _settle(
         )
 
 
+async def _start_stream(
+    db: Session,
+    route: ModelRoute,
+    provider_request: ChatRequest,
+    reservation: quota.Reservation,
+    *,
+    request_id: uuid.UUID,
+    include_usage: bool,
+    started: float,
+    response: Response,
+) -> GatewayStreamingResponse:
+    """Open the provider stream and wait for its first item (the provider's "accepted"
+    chunk), then hand it to a StreamSettlement and the streaming response.
+
+    Until that first item, failures are settled as for non-streaming requests and returned
+    as ordinary HTTP errors. Nothing watches the client during this wait (see chat_stream).
+    """
+    provider_stream = route.provider.stream(provider_request)
+    owner = StreamSettlement(
+        provider_stream,
+        partial(_settle, db, reservation, model=route.public_id, started=started),
+        request_id,
+    )
+    try:
+        first = await provider_stream.__anext__()
+    except ProviderError as exc:
+        await owner.finish(usage=exc.usage, succeeded=False, may_have_consumed_tokens=exc.may_have_consumed_tokens)
+        raise _provider_http_error(route, exc) from exc
+    except StopAsyncIteration:
+        # The provider ended without yielding anything: a contract violation, and the request
+        # was sent, so it may have consumed tokens. Not a success, and not a bare 500.
+        logger.error("Provider %s ended a stream without any chunk (model %s)", route.provider.name, route.public_id)
+        await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True)
+        raise _provider_http_error(route, ProviderError("provider stream ended without any chunk")) from None
+    except BaseException:
+        # A bug in the provider, or cancellation: close and settle conservatively, then re-raise.
+        with anyio.CancelScope(shield=True):
+            await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True)
+        raise
+
+    # Headers set by dependencies (X-RateLimit-*) are only merged by FastAPI into responses it
+    # builds itself, so they are copied onto the streaming response explicitly.
+    headers = {
+        key: value for key, value in response.headers.items() if key.lower() not in ("content-length", "content-type")
+    }
+    meta = stream_meta(request_id, route.public_id, include_usage)
+    return GatewayStreamingResponse(
+        sse_events(first, provider_stream, owner, meta, route), owner=owner, headers=headers
+    )
+
+
 @router.post("/chat/completions", response_model=ChatCompletionResponse)
 async def chat_completions(
     body: ChatCompletionRequest,
+    response: Response,
     registry: ModelRegistry = Depends(get_model_registry),
     client: AuthenticatedClient = Depends(require_api_key),
     db: Session = Depends(get_db),
-) -> ChatCompletionResponse:
+) -> ChatCompletionResponse | GatewayStreamingResponse:
     logger.info(
         "Chat completion for application %s (key %s), model %s",
         client.application_name, client.key_prefix, body.model,
@@ -243,11 +301,20 @@ async def chat_completions(
             detail="Quota accounting is temporarily unavailable",
         ) from exc
 
+    started = time.monotonic()
+    if body.stream:
+        return await _start_stream(
+            db, route, provider_request, reservation,
+            request_id=request_id,
+            include_usage=body.stream_options is not None and body.stream_options.include_usage,
+            started=started,
+            response=response,
+        )
+
     # Provider call: no database transaction or connection is held here. A non-provider
     # exception (a bug) or cancellation leaves the reservation for expire-reservations.
-    started = time.monotonic()
     try:
-        response = await provider.chat(provider_request)
+        completion = await provider.chat(provider_request)
     except ProviderError as exc:
         await _settle(
             db, reservation, usage=exc.usage, succeeded=False,
@@ -257,10 +324,10 @@ async def chat_completions(
 
     # Transaction 2.
     await _settle(
-        db, reservation, usage=response.usage, succeeded=True,
+        db, reservation, usage=completion.usage, succeeded=True,
         may_have_consumed_tokens=True, model=route.public_id, started=started,
     )
-    return _to_http_response(response, request_id, route.public_id)
+    return _to_http_response(completion, request_id, route.public_id)
 
 
 @router.get("/models", response_model=ModelList)

@@ -227,7 +227,7 @@ echo 'MODEL_REGISTRY_FILE=models.json' >> .env
 {
   "providers": {
     "groq":   {"type": "openai_compatible", "base_url": "https://api.groq.com/openai/v1",
-               "api_key_env": "GROQ_API_KEY", "timeout_seconds": 60},
+               "api_key_env": "GROQ_API_KEY", "timeout_seconds": 60, "stream_usage": false},
     "ollama": {"type": "openai_compatible", "base_url": "http://localhost:11434/v1",
                "timeout_seconds": 120},
     "fake":   {"type": "fake"}
@@ -248,7 +248,8 @@ letters, digits, `-` and `_`. It is recorded in usage records.
 | `type` | all | `openai_compatible` (any OpenAI-style `/chat/completions` API: Groq, Ollama, vLLM, ...) or `fake` (deterministic test provider; serves only `fake-model`) |
 | `base_url` | `openai_compatible`, required | `http://` or `https://` URL, without credentials |
 | `api_key_env` | `openai_compatible`, optional | **Name** of the environment variable holding the bearer token. Omit it for servers that need no key (Ollama). |
-| `timeout_seconds` | `openai_compatible`, optional | Whole-request timeout, including generation (default 60) |
+| `timeout_seconds` | `openai_compatible`, optional | Whole-request timeout, including generation (default 60). For a streamed request it bounds the whole stream. |
+| `stream_usage` | `openai_compatible`, optional | `true` to ask the server for token usage on streamed requests (`stream_options.include_usage`). Default `false`; see [Streaming](#streaming). |
 
 **`models`**: one entry per public model ID. The key is the public ID: letters, digits and
 `. _ : / -`, starting with a letter or digit, at most 128 characters, case-sensitive.
@@ -771,6 +772,10 @@ together with the rows they summarize, inside that one locked transaction.
   safety margin, so it never settles a request that is still running. For example, with a
   slowest provider at 120 s, use at least 10 minutes. The default of 60 minutes covers any
   sensible timeout. There is no background worker.
+- **Streamed requests** are settled when the stream ends, however it ends (completion, error,
+  client disconnect); see [Streaming](#streaming). Only a crash or a database failure leaves a
+  stream's reservation for `expire-reservations`. Because `timeout_seconds` bounds a whole
+  stream, the same minimum age applies.
 
 ### Managing quotas
 
@@ -879,8 +884,139 @@ cd backend && alembic upgrade head      # expect 77dc84617c96 (head) afterwards
 - **Stale reservations need the recovery command.** Until `expire-reservations` runs, they keep
   holding tokens.
 - **No resets, billing or per-key quotas.** Quotas are per application.
-- **No streaming yet.** Quota handling covers non-streamed requests only, because streaming isn't
-  implemented.
+- **Streams that end early cost the full reservation.** A stream cut short by a disconnect or an
+  error is charged its full reservation (usage is unknown at that point), as are streams from
+  providers that don't report streaming usage.
+
+## Streaming
+
+`POST /v1/chat/completions` streams the reply as
+[Server-Sent Events](https://html.spec.whatwg.org/multipage/server-sent-events.html) when the
+request has `"stream": true`, in the OpenAI chat completion chunk format. Authentication, rate
+limiting, model routing and quota reservation are the same as for other requests.
+
+```bash
+curl -N localhost:8000/v1/chat/completions \
+  -H "Authorization: Bearer $INFERENCEFLOW_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model": "fake-model", "messages": [{"role": "user", "content": "Hi"}],
+       "stream": true, "stream_options": {"include_usage": true}}'
+```
+
+OpenAI client SDKs work unchanged (`stream=True`, `stream_options={"include_usage": True}`).
+
+### Response
+
+Headers: `Content-Type: text/event-stream; charset=utf-8`, `Cache-Control: no-cache`,
+`X-Accel-Buffering: no` (tells nginx-style proxies not to buffer), and the usual
+`X-RateLimit-*` headers. Each event is one `data:` line followed by a blank line:
+
+```
+data: {"id":"chatcmpl-5d1c…","object":"chat.completion.chunk","created":1763900000,"model":"fake-model","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5d1c…","object":"chat.completion.chunk","created":1763900000,"model":"fake-model","choices":[{"index":0,"delta":{"content":"Fake"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5d1c…","object":"chat.completion.chunk","created":1763900000,"model":"fake-model","choices":[{"index":0,"delta":{"content":" response"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5d1c…","object":"chat.completion.chunk","created":1763900000,"model":"fake-model","choices":[{"index":0,"delta":{"content":" to:"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5d1c…","object":"chat.completion.chunk","created":1763900000,"model":"fake-model","choices":[{"index":0,"delta":{"content":" Hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-5d1c…","object":"chat.completion.chunk","created":1763900000,"model":"fake-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"chatcmpl-5d1c…","object":"chat.completion.chunk","created":1763900000,"model":"fake-model","choices":[],"usage":{"prompt_tokens":1,"completion_tokens":4,"total_tokens":5}}
+
+data: [DONE]
+```
+
+1. A **role chunk** (`"delta": {"role": "assistant", "content": ""}`).
+2. **Content chunks**, as the provider produces them (`"delta": {"content": "..."}`).
+3. A **finish chunk** with an empty delta and `finish_reason` `stop` or `length`.
+4. A **usage chunk**, only if the request had `"stream_options": {"include_usage": true}`. It
+   has no choices; `usage` is `null` when the provider didn't report usage (never estimated).
+5. `data: [DONE]`.
+
+Every chunk has the same `id` (the gateway's request ID, also used in `GET /v1/usage`) and
+`created`, and `model` is always the public model ID. `stream_options` is ignored when
+`stream` is false. Reasoning output from reasoning models (for example gpt-oss) is not
+forwarded; only content is.
+
+**A stream succeeded only if it contains a chunk with a non-null `finish_reason` and ends with
+`data: [DONE]`.** `[DONE]` is sent after the request's usage has been settled. Treat any other
+ending as incomplete: client SDKs don't always report a connection that just closes (the
+openai Python SDK ends the iteration silently in that case).
+
+### Errors
+
+**Before the stream starts**, errors are ordinary HTTP responses, exactly as for non-streamed
+requests: 401, 404 `model_not_found`, 422, 429 (rate limit or quota), and the provider errors in
+[Unknown models and provider errors](#unknown-models-and-provider-errors). The gateway waits
+until the provider has accepted the request before it sends the `200` and the role chunk, so
+connection failures, upstream 4xx/5xx responses and timeouts until then get their usual status.
+
+**After the stream started**, the status is already `200`. A failure is sent as one error event,
+and the stream then ends **without** a finish chunk or `[DONE]`:
+
+```
+data: {"error":{"message":"The provider did not respond in time.","type":"provider_error","code":"provider_timeout"}}
+```
+
+| Cause | `type` | `code` | `message` |
+|---|---|---|---|
+| Provider timeout, including the stream deadline | `provider_error` | `provider_timeout` | `The provider did not respond in time.` |
+| Connection to the provider lost | `provider_error` | `provider_unavailable` | `The provider is temporarily unavailable.` |
+| Upstream error event, invalid stream, or a stream that ended before its finish reason | `provider_error` | `provider_error` | `The provider returned an unexpected response.` |
+| A gateway bug | `server_error` | `internal_error` | `An internal error occurred.` |
+
+The event has no `event:` field. The openai Python SDK (checked with 1.90 and 3.3) raises
+`openai.APIError` for it, with `message`, `code` and `type` as above. Messages are fixed: upstream
+messages, URLs and stack traces stay in the server log.
+
+### Usage accounting
+
+The quota is reserved before the provider is called, with the same estimate as a non-streamed
+request, and no database connection is held while streaming. When the stream ends, the
+reservation is settled **once**:
+
+| How the stream ended | Charged | Usage record |
+|---|---|---|
+| Completed, provider reported usage | the actual total | `succeeded` |
+| Completed, no (or invalid) usage | the full reservation | `succeeded`, `usage_reported: false` |
+| Failed before the stream started | as for non-streamed requests (released if the provider certainly did nothing) | `failed`, or none |
+| Failed after it started, client disconnected, or cancelled | the full reservation | `failed`, `usage_reported: false` |
+
+A request that fails after streaming started may already have used tokens upstream and the
+actual number is unknown, so the full reservation is charged; token counts are never made up.
+
+**Upstream usage reporting (`stream_usage`).** Some OpenAI-compatible servers (OpenAI, vLLM)
+only report usage on a stream when asked with `stream_options.include_usage`; others reject that
+option. The gateway only sends it for providers configured with `"stream_usage": true`, and
+never retries a request without it. With the default `false`, streams from servers that only
+report usage on request are charged their full reservation. Usage is read from the standard
+`usage` field, or from Groq's `x_groq.usage`, whichever the server sends; invalid usage is
+logged and treated as unreported, without failing the stream. Enable `stream_usage` for a
+provider once you have checked that it accepts the option.
+
+### Disconnects and timeouts
+
+When a client disconnects mid-stream, the gateway stops reading from the provider and closes
+the upstream request (which stops generation there), then settles the reservation as above.
+
+One limitation: while the gateway is waiting for the provider to accept the request (before the
+response starts), it does not watch the client connection. A client that disconnects during
+that wait is noticed as soon as the provider answers, and the stream is closed and settled then.
+The wait is normally short and is bounded by the provider's `timeout_seconds`; the charge is
+the same either way. The same applies to non-streamed requests for their whole duration.
+
+A provider's `timeout_seconds` bounds the **whole** stream (connecting, waiting and reading),
+not each read, so a slowly trickling stream still ends at that deadline with a
+`provider_timeout` error event. Pick it with your longest expected generation in mind.
+
+### Not included
+
+No WebSockets, keep-alive comments, resumable streams, retries or failover, tool calls,
+`n > 1`, logprobs, reasoning passthrough, or limits on concurrent streams per key. A
+reasoning model can be silent for a while before its first content chunk; proxies with short
+idle timeouts may need a longer one. The legacy `/generate` endpoint does not stream.
 
 ## Testing
 

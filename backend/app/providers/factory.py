@@ -19,6 +19,10 @@ def create_provider(name: str, config: "ProviderConfig", *, api_key: str | None 
         return FakeProvider(name=name)
     if config.type == "openai_compatible":
         return OpenAICompatibleProvider(
-            config.base_url, api_key=api_key, timeout_seconds=config.timeout_seconds, name=name
+            config.base_url,
+            api_key=api_key,
+            timeout_seconds=config.timeout_seconds,
+            name=name,
+            stream_usage=config.stream_usage,
         )
     raise ValueError(f"unknown provider type: {config.type!r}")

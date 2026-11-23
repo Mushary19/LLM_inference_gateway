@@ -4,7 +4,8 @@
       "type": "openai_compatible",
       "base_url": "https://api.groq.com/openai/v1",
       "api_key_env": "GROQ_API_KEY",
-      "timeout_seconds": 60
+      "timeout_seconds": 60,
+      "stream_usage": false
     },
     "ollama": {
       "type": "openai_compatible",
