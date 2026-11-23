@@ -483,7 +483,11 @@ def test_mid_stream_provider_errors_are_safe_error_events(client, use_provider, 
     assert all(p["choices"][0]["finish_reason"] is None for p in payloads[:-1])  # never a finish chunk
     for leaked in ("10.1.2.3", "sk-live", "Traceback", "upstream http"):
         assert leaked not in response.text
-    assert "failed mid-stream" in caplog.text and SECRET_DETAIL in caplog.text  # details stay in the log
+    # Logged as metadata (error type), never with the upstream text.
+    assert type(error).__name__ in caplog.text or "check the model registry" in caplog.text
+    assert SECRET_DETAIL not in caplog.text
+    for leaked in ("10.1.2.3", "sk-live", "upstream http"):
+        assert leaked not in caplog.text
     assert provider.closed == 1
     assert_settled_once(db_session, api_key.record.application_id, charged=ESTIMATE, status=UsageStatus.FAILED, reported=False)
 
@@ -950,8 +954,8 @@ def test_finish_closes_and_settles_exactly_once():
         stream = provider.stream(None)
         await stream.__anext__()
         owner = StreamSettlement(stream, settle, uuid.uuid4())
-        await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True)
-        await owner.finish(usage=Usage(1, 1), succeeded=True, may_have_consumed_tokens=True)
+        await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True, outcome="client_disconnected")
+        await owner.finish(usage=Usage(1, 1), succeeded=True, may_have_consumed_tokens=True, outcome="completed")
         return owner
 
     owner = asyncio.run(scenario())
@@ -969,7 +973,7 @@ def test_finish_is_shielded_from_cancellation():
         owner = StreamSettlement(stream, settle, uuid.uuid4())
         with anyio.CancelScope() as scope:
             scope.cancel()  # already cancelled when finish() starts
-            await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True)
+            await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True, outcome="cancelled")
             await anyio.sleep(0)  # the cancellation was only postponed, and strikes here
         assert scope.cancelled_caught
 
@@ -991,7 +995,7 @@ def test_a_failing_close_still_settles_and_a_failing_settle_is_logged(caplog):
     settle = RecordingSettle(fail=RuntimeError("settle failed"))
 
     asyncio.run(StreamSettlement(Unclosable(), settle, uuid.uuid4()).finish(
-        usage=None, succeeded=False, may_have_consumed_tokens=True))
+        usage=None, succeeded=False, may_have_consumed_tokens=True, outcome="gateway_error"))
 
     assert len(settle.calls) == 1
     assert "Could not close the provider stream" in caplog.text and "Could not settle" in caplog.text
@@ -1025,7 +1029,7 @@ def test_real_settlement_runs_even_if_cancelled_while_waiting_for_a_worker_threa
                 with anyio.CancelScope() as scope:
                     scope.cancel()
                     threading.Timer(0.2, release.set).start()
-                    await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True)
+                    await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True, outcome="cancelled")
                 return provider
         finally:
             limiter.total_tokens = original

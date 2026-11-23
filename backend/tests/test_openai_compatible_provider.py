@@ -532,7 +532,10 @@ def test_upstream_failures_leak_nothing(client_with_upstream, upstream, status, 
     assert response.status_code == status
     for leaked in (SECRET, UPSTREAM_ID, "localhost", "11434", "10.0.3.7", "groq", "API key", "html"):
         assert leaked not in response.text
-    assert SECRET not in caplog.text  # details are logged, credentials never
+    # Only metadata is logged: no credentials and no upstream text. (The provider model ID may
+    # appear, from the registry, in the misconfiguration error for a 404.)
+    for leaked in (SECRET, "10.0.3.7", "Errno 111", "timed out reading", "Invalid API key", "Rate limit reached", "proxy error", "11434"):
+        assert leaked not in caplog.text
 
 
 def test_upstream_400_keeps_a_useful_sanitized_message(client_with_upstream, caplog):
@@ -546,7 +549,9 @@ def test_upstream_400_keeps_a_useful_sanitized_message(client_with_upstream, cap
     assert response.json() == {
         "detail": f"The provider rejected the request: Model {PUBLIC} context window is 8192 tokens; see [redacted]"
     }
-    assert UPSTREAM_ID in caplog.text  # the server log keeps the original
+    # The log has the failure's metadata, not the upstream message (the client has it, sanitized).
+    assert "InvalidProviderRequestError, upstream status 400" in caplog.text
+    assert "context window" not in caplog.text and UPSTREAM_ID not in caplog.text
     assert SECRET not in caplog.text
 
 

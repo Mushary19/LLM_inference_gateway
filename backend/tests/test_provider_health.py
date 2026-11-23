@@ -351,13 +351,36 @@ def test_reports_never_contain_upstream_details(caplog):
     text = repr(report)
     for leaked in (SECRET, "internal-llm", "10.0.0.9", "rejected"):
         assert leaked not in text
-    # Nothing from the application at INFO or above; upstream text goes to DEBUG only.
+    # Nothing from the application at INFO or above.
     # (httpx's own INFO request lines are outside the app; the CLI doesn't enable INFO logging.)
     assert [r for r in caplog.records if r.name.startswith("app.")] == []
 
 
+def test_probe_failures_log_metadata_only_even_at_debug(caplog):
+    message = f"upstream {BASE_URL} rejected key {SECRET} at 10.0.0.9"
+    upstreams = [
+        Upstream(httpx.Response(500, json={"error": {"message": message}})),
+        Upstream(httpx.Response(401, json={"error": {"message": message}})),
+        Upstream(raises=httpx.ConnectError(message)),
+        Upstream(httpx.Response(200, text=message)),
+    ]
+    providers = {f"p{i}": provider_for(u, name=f"p{i}") for i, u in enumerate(upstreams)}
+    registry = ModelRegistry(providers, [ModelRoute(f"m{i}", p, "x") for i, p in enumerate(providers.values())])
+
+    with caplog.at_level(logging.DEBUG, logger="app"):
+        check(registry)
+
+    probe_lines = [r for r in caplog.records if r.name == "app.services.provider_health"]
+    assert len(probe_lines) == 4
+    assert "upstream status 401, reason authentication_failed" in caplog.text
+    for record in probe_lines:
+        assert not record.exc_info  # provider errors: no traceback, which would quote the message
+    for leaked in (SECRET, "internal-llm", "10.0.0.9", "rejected key"):
+        assert leaked not in caplog.text
+
+
 def test_debug_logging_never_contains_the_key():
-    """Debug logs keep upstream messages for operators, but the key is never part of them."""
+    """Debug logs carry the failure's metadata: neither the key nor the upstream message."""
     provider = provider_for(Upstream(httpx.Response(500, json={"error": {"message": "overloaded"}})))
     logger = logging.getLogger("app.services.provider_health")
     records: list[logging.LogRecord] = []
@@ -373,7 +396,8 @@ def test_debug_logging_never_contains_the_key():
         logger.setLevel(old_level)
 
     [record] = records
-    assert "overloaded" in record.getMessage()
+    assert "ProviderError (upstream status 500, reason server_error)" in record.getMessage()
+    assert "overloaded" not in record.getMessage() and not record.exc_info
     assert SECRET not in record.getMessage()
 
 

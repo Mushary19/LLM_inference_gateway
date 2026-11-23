@@ -125,8 +125,13 @@ async def probe_provider(name: str, provider: Provider, timeout: float) -> Provi
         listed = frozenset(model.id for model in models)
     except Exception as exc:  # deliberately broad: any failure is a result, not a crash
         status, reason = classify_failure(exc)
-        # Debug only: upstream text may contain internal URLs. Operators can enable it.
-        logger.debug("Probe of provider %s failed (%s): %s", name, type(exc).__name__, exc, exc_info=True)
+        # Metadata only: the exception's text is upstream content (messages, URLs). A traceback
+        # is kept for unexpected (non-provider) exceptions, where it points at a gateway bug.
+        logger.debug(
+            "Probe of provider %s failed: %s (upstream status %s, reason %s)",
+            name, type(exc).__name__, getattr(exc, "status_code", None), reason,
+            exc_info=not isinstance(exc, ProviderError),
+        )
         return ProviderCheck(name, status, reason, _elapsed_ms(started))
     return ProviderCheck(name, "healthy", None, _elapsed_ms(started), listed)
 

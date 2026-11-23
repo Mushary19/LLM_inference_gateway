@@ -9,10 +9,17 @@ not the legacy /generate pipeline.
 Routing: the request's public model ID is resolved in the model registry
 (app/providers/registry.py) to a provider instance and that provider's own model ID. Clients
 only ever see public IDs. Provider-specific model IDs, provider URLs and upstream error
-details stay in the server logs.
+details never reach clients. Provider failures are logged as structured metadata (error type,
+upstream status), without the upstream error text (see inference_log.log_provider_failure).
 
 Streaming ("stream": true) shares everything up to and including the quota reservation; the
 streamed response and its settlement are in app/api/chat_stream.py.
+
+Request IDs: the reservation, the usage record and `chatcmpl-<hex>` use the request's internal
+gateway UUID (app/core/request_context.py), never the client's X-Request-ID. Every request
+that gets as far as the provider logs one `inference_request_finished` line
+(app/api/inference_log.py): from this module for non-streaming requests, from
+StreamSettlement.finish() for streams.
 """
 
 import logging
@@ -29,7 +36,9 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import AuthenticatedClient, require_api_key
 from app.api.chat_stream import GatewayStreamingResponse, StreamSettlement, sse_events, stream_meta
+from app.api.inference_log import InferenceSummary, interrupted_outcome, log_provider_failure, provider_error_outcome
 from app.api.v1 import router
+from app.core import request_context
 from app.core.config import settings
 from app.database.connection import get_db
 from app.providers.base import (
@@ -58,7 +67,7 @@ from app.services import quota
 logger = logging.getLogger(__name__)
 
 # Most specific first; anything else from a provider is a bad gateway. Public messages are
-# fixed: upstream details (URLs, provider model IDs, response bodies) go to the logs only.
+# fixed: upstream details (URLs, provider model IDs, response bodies) never reach the client.
 # A ModelNotFoundError here means the registry routed a public model to a provider that
 # doesn't serve it, which is a gateway configuration problem, not a client error.
 _ERROR_RESPONSES: list[tuple[type[ProviderError], int, str]] = [
@@ -103,20 +112,15 @@ def sanitize_upstream_message(message: str, route: ModelRoute) -> str:
     return text
 
 
-def _provider_http_error(route: ModelRoute, exc: ProviderError) -> HTTPException:
+def _provider_http_error(route: ModelRoute, exc: ProviderError, *, stream: bool) -> HTTPException:
     status_code, message = next(
         ((code, text) for error_type, code, text in _ERROR_RESPONSES if isinstance(exc, error_type)),
         _DEFAULT_ERROR_RESPONSE,
     )
-    if isinstance(exc, ModelNotFoundError):
-        logger.error(
-            "Provider %s does not serve model %r (public model %s); check the model registry: %s",
-            route.provider.name, route.provider_model_id, route.public_id, exc,
-        )
-    else:
-        logger.warning(
-            "Provider %s failed for model %s (%s): %s", route.provider.name, route.public_id, type(exc).__name__, exc
-        )
+    log_provider_failure(
+        provider=route.provider.name, model=route.public_id, provider_model_id=route.provider_model_id,
+        stream=stream, phase="before_accept" if stream else "response", exc=exc,
+    )
     if isinstance(exc, InvalidProviderRequestError):
         upstream = sanitize_upstream_message(str(exc), route)
         if upstream:
@@ -180,10 +184,11 @@ async def _settle(
     may_have_consumed_tokens: bool,
     model: str,
     started: float,
-) -> None:
+) -> bool:
     """Settle the reservation. If the database fails, keep the response: the provider has
     already done the work. The reservation stays `reserved` and holds its tokens until
-    `python -m app.cli expire-reservations` settles it."""
+    `python -m app.cli expire-reservations` settles it. Returns whether it settled (for the
+    lifecycle log only)."""
     try:
         await run_in_threadpool(
             quota.settle,
@@ -200,6 +205,8 @@ async def _settle(
             "Could not settle quota reservation for request %s; it stays reserved until expired",
             reservation.request_id,
         )
+        return False
+    return True
 
 
 async def _start_stream(
@@ -212,6 +219,7 @@ async def _start_stream(
     include_usage: bool,
     started: float,
     response: Response,
+    summary: InferenceSummary,
 ) -> GatewayStreamingResponse:
     """Open the provider stream and wait for its first item (the provider's "accepted"
     chunk), then hand it to a StreamSettlement and the streaming response.
@@ -224,22 +232,35 @@ async def _start_stream(
         provider_stream,
         partial(_settle, db, reservation, model=route.public_id, started=started),
         request_id,
+        summary,
     )
     try:
         first = await provider_stream.__anext__()
     except ProviderError as exc:
-        await owner.finish(usage=exc.usage, succeeded=False, may_have_consumed_tokens=exc.may_have_consumed_tokens)
-        raise _provider_http_error(route, exc) from exc
+        http_error = _provider_http_error(route, exc, stream=True)
+        await owner.finish(
+            usage=exc.usage, succeeded=False, may_have_consumed_tokens=exc.may_have_consumed_tokens,
+            outcome=provider_error_outcome(exc), http_status=http_error.status_code,
+        )
+        raise http_error from exc
     except StopAsyncIteration:
         # The provider ended without yielding anything: a contract violation, and the request
         # was sent, so it may have consumed tokens. Not a success, and not a bare 500.
         logger.error("Provider %s ended a stream without any chunk (model %s)", route.provider.name, route.public_id)
-        await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True)
-        raise _provider_http_error(route, ProviderError("provider stream ended without any chunk")) from None
-    except BaseException:
+        http_error = _provider_http_error(route, ProviderError("provider stream ended without any chunk"), stream=True)
+        await owner.finish(
+            usage=None, succeeded=False, may_have_consumed_tokens=True,
+            outcome="provider_error", http_status=http_error.status_code,
+        )
+        raise http_error from None
+    except BaseException as exc:
         # A bug in the provider, or cancellation: close and settle conservatively, then re-raise.
+        outcome = interrupted_outcome(exc)
         with anyio.CancelScope(shield=True):
-            await owner.finish(usage=None, succeeded=False, may_have_consumed_tokens=True)
+            await owner.finish(
+                usage=None, succeeded=False, may_have_consumed_tokens=True,
+                outcome=outcome, http_status=500 if outcome == "gateway_error" else None,
+            )
         raise
 
     # Headers set by dependencies (X-RateLimit-*) are only merged by FastAPI into responses it
@@ -272,7 +293,8 @@ async def chat_completions(
         logger.info("Rejected request for application %s: %s", client.application_name, exc)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=MODEL_NOT_FOUND) from exc
 
-    request_id = uuid.uuid4()
+    # The internal UUID: the key of the reservation and usage record. Never the client's ID.
+    request_id = request_context.gateway_request_id()
     provider = route.provider
     provider_request = _to_provider_request(body, route)
     estimate = quota.estimate_request_tokens(
@@ -302,6 +324,7 @@ async def chat_completions(
         ) from exc
 
     started = time.monotonic()
+    summary = InferenceSummary(provider=provider.name, model=route.public_id, stream=body.stream, started=started)
     if body.stream:
         return await _start_stream(
             db, route, provider_request, reservation,
@@ -309,25 +332,38 @@ async def chat_completions(
             include_usage=body.stream_options is not None and body.stream_options.include_usage,
             started=started,
             response=response,
+            summary=summary,
         )
 
-    # Provider call: no database transaction or connection is held here. A non-provider
-    # exception (a bug) or cancellation leaves the reservation for expire-reservations.
     try:
-        completion = await provider.chat(provider_request)
-    except ProviderError as exc:
-        await _settle(
-            db, reservation, usage=exc.usage, succeeded=False,
-            may_have_consumed_tokens=exc.may_have_consumed_tokens, model=route.public_id, started=started,
-        )
-        raise _provider_http_error(route, exc) from exc
+        # Provider call: no database transaction or connection is held here. A non-provider
+        # exception (a bug) or cancellation leaves the reservation for expire-reservations.
+        try:
+            completion = await provider.chat(provider_request)
+        except ProviderError as exc:
+            summary.settlement = "unknown"
+            settled = await _settle(
+                db, reservation, usage=exc.usage, succeeded=False,
+                may_have_consumed_tokens=exc.may_have_consumed_tokens, model=route.public_id, started=started,
+            )
+            summary.settlement = "succeeded" if settled else "failed"
+            http_error = _provider_http_error(route, exc, stream=False)
+            summary.finish(outcome=provider_error_outcome(exc), http_status=http_error.status_code, usage=exc.usage)
+            raise http_error from exc
 
-    # Transaction 2.
-    await _settle(
-        db, reservation, usage=completion.usage, succeeded=True,
-        may_have_consumed_tokens=True, model=route.public_id, started=started,
-    )
-    return _to_http_response(completion, request_id, route.public_id)
+        # Transaction 2.
+        summary.settlement = "unknown"
+        settled = await _settle(
+            db, reservation, usage=completion.usage, succeeded=True,
+            may_have_consumed_tokens=True, model=route.public_id, started=started,
+        )
+        summary.settlement = "succeeded" if settled else "failed"
+        result = _to_http_response(completion, request_id, route.public_id)
+        summary.finish(outcome="completed", http_status=status.HTTP_200_OK, usage=completion.usage)
+        return result
+    except BaseException as exc:
+        summary.finish_interrupted(exc)  # no-op if the outcome was already logged
+        raise
 
 
 @router.get("/models", response_model=ModelList)

@@ -183,7 +183,11 @@ def test_provider_errors_map_to_http_status(client, use_provider, error, expecte
 
     assert response.status_code == expected_status
     assert response.json() == {"detail": expected_detail}
-    assert "Provider fake" in caplog.text and str(error) in caplog.text  # details stay in the server log
+    assert f"Provider fake failed for model {FAKE_MODEL}: {type(error).__name__}" in caplog.text or (
+        isinstance(error, ModelNotFoundError) and "check the model registry" in caplog.text
+    )
+    if str(error):
+        assert str(error) not in caplog.text  # upstream text is never logged, only its type
 
 
 def test_unexpected_provider_exception_is_a_500(use_provider, db_session, auth_headers):

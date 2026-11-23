@@ -332,7 +332,8 @@ record, no provider call.
 ```
 
 Provider failures keep their status codes, with fixed public messages. Upstream details
-(internal URLs, provider model IDs, response bodies) go to the server log only.
+(internal URLs, provider model IDs, response bodies) never reach the client, and the server
+log records only the failure's type and upstream HTTP status (see "Logging and request IDs").
 
 | Provider failure | Status | `detail` |
 |---|---|---|
@@ -517,7 +518,8 @@ inference `timeout_seconds`. A probe that times out is cancelled, and its connec
 
 - Reports contain fixed codes only. They never contain upstream messages, base URLs, keys or
   environment values.
-- Upstream error details are logged at DEBUG level only.
+- Probe failures are logged at DEBUG level as metadata only (error type, upstream status,
+  reason code), never with the upstream error text.
 - `provider_model_id` is shown, because the operator needs it to fix a `not_listed` model and
   already has it in `models.json`.
 
@@ -969,7 +971,8 @@ data: {"error":{"message":"The provider did not respond in time.","type":"provid
 
 The event has no `event:` field. The openai Python SDK (checked with 1.90 and 3.3) raises
 `openai.APIError` for it, with `message`, `code` and `type` as above. Messages are fixed: upstream
-messages, URLs and stack traces stay in the server log.
+messages, URLs and stack traces are never sent; the server log has the failure's type and
+upstream status.
 
 ### Usage accounting
 
@@ -1017,6 +1020,119 @@ No WebSockets, keep-alive comments, resumable streams, retries or failover, tool
 `n > 1`, logprobs, reasoning passthrough, or limits on concurrent streams per key. A
 reasoning model can be silent for a while before its first content chunk; proxies with short
 idle timeouts may need a longer one. The legacy `/generate` endpoint does not stream.
+
+## Logging and request IDs
+
+### Request IDs
+
+Every response carries an `X-Request-ID` header, and every application log line written while
+handling a request includes it, so a client can quote it when reporting a problem.
+
+- Send your own correlation ID in `X-Request-ID` and the gateway uses it: it must be 1–64
+  characters of `A-Z a-z 0-9 . _ : -`. Only the first `X-Request-ID` header counts.
+- If you send none, or one that doesn't match, the gateway generates a UUID and returns it.
+- Errors carry the header too: 401, 404, 422, 429, the provider errors, and the plain
+  `Internal Server Error` 500 for an unexpected failure.
+
+```bash
+curl -i http://localhost:8000/v1/models \
+  -H "Authorization: Bearer $INFERENCEFLOW_API_KEY" -H "X-Request-ID: my-trace-42"
+# HTTP/1.1 200 OK
+# x-request-id: my-trace-42
+```
+
+Each request also gets an **internal gateway request ID**, a UUID the gateway always
+generates itself. It is what the database uses: the key of the request's quota reservation and
+usage record (`request_id` in `usage_records` and `quota_reservations`), and the hex in the
+completion ID `chatcmpl-<hex>`. Your `X-Request-ID` is never stored there. It is arbitrary text,
+and clients reuse it (retries), while those keys are UUIDs and unique. Both IDs appear in every
+log line (`request_id` and `gateway_request_id`), which links your ID to the usage record. When
+you send no `X-Request-ID`, the two are the same UUID.
+
+### Log format
+
+The gateway's own log lines (loggers under `app`) go to stdout, one JSON object per line by
+default:
+
+```json
+{"timestamp": "2026-11-23T10:15:02.481Z", "level": "INFO", "logger": "app.api.inference_log", "message": "Inference request finished: completed", "event": "inference_request_finished", "request_id": "my-trace-42", "gateway_request_id": "0b8e6f0e-2a1c-4c55-9a4e-5f7d1c2b9e10", "provider": "groq", "model": "gpt-oss-120b", "stream": true, "outcome": "completed", "http_status": 200, "duration_ms": 1834.2, "usage_reported": true, "settlement": "succeeded", "prompt_tokens": 21, "completion_tokens": 187, "stream_completed": true, "client_disconnected": false}
+```
+
+| Setting | Default | |
+|---|---|---|
+| `LOG_LEVEL` | `INFO` | `DEBUG`, `INFO`, `WARNING`, `ERROR` or `CRITICAL` (any case) |
+| `LOG_FORMAT` | `json` | `json`, or `text` for readable lines during local development |
+
+Every line has `timestamp` (UTC), `level`, `logger` and `message`. Lines written while handling
+a request also have `request_id` and `gateway_request_id`. A logged exception adds `exception`
+(the traceback). Structured events add `event` and their own fields.
+
+uvicorn's own logs (startup, and its access log) are unchanged and still go to stderr in
+uvicorn's format. Before this, nothing configured the `app` loggers, so their INFO lines (for
+example rate-limit and quota rejections) were silently dropped under uvicorn.
+
+### Lifecycle events
+
+`http_request_finished` is logged once per HTTP request, when the response has been sent
+completely; for a stream, that is when the stream ends. Fields: `method`, `route` (the route
+template, such as `/v1/chat/completions`; `null` when no route matched, never the raw path),
+`status_code`, `duration_ms`. If an exception escaped (an unexpected failure, or a cancelled
+request), it also has `error_type`, plus `exception` for an unexpected failure.
+
+`inference_request_finished` is logged exactly once for each chat completion that got past
+its quota reservation to the provider, on every path, including failures, disconnects and
+cancellation. Requests rejected earlier (401, 404, 422, 429, 503) have only their own log line
+and `http_request_finished`. Fields:
+
+| Field | |
+|---|---|
+| `provider`, `model` | the provider instance and the **public** model ID |
+| `stream` | whether the request was streamed |
+| `outcome` | what happened to the inference (below) |
+| `http_status` | the status the client got (`null` if the request was cancelled before a response) |
+| `duration_ms` | from the provider call until the request finished (for a stream: the whole stream) |
+| `usage_reported`, `prompt_tokens`, `completion_tokens` | whether the provider reported usage, and the counts when it did |
+| `settlement` | `succeeded`, `failed` (the reservation stays for `expire-reservations`), `not_attempted` (an unexpected failure or cancellation before settling, also left for expiry) or `unknown` (settling was interrupted) |
+| `stream_completed`, `client_disconnected` | streams only |
+
+Outcomes: `completed`, `provider_error`, `timeout`, `provider_rejected` (the provider refused
+the request as invalid: an upstream 400, 413 or 422, e.g. context too long), `gateway_error` (a bug or unexpected failure in the
+gateway), `client_disconnected`, `cancelled` (the request was cancelled without the client
+disconnecting, e.g. by a server shutdown). The outcome is not the HTTP status. A stream answers
+200 as soon as the provider accepts it, and can still end with `provider_error`, `timeout` or
+`client_disconnected`.
+
+Gateway rejections (401, 404, 422, 429, 503) never get an outcome: they happen before
+inference. So `provider_rejected` always means the upstream refused the request.
+
+`provider_request_failed` is logged for each provider failure, at WARNING (at ERROR when the
+provider doesn't serve the registered model, which is a registry misconfiguration; that line
+adds `provider_model_id` from the registry). Fields: `provider`, `model`, `stream`, `phase`
+(`response`, `before_accept` or `mid_stream`), `error_type` (e.g. `ProviderTimeoutError`),
+`upstream_status` (the provider's HTTP status, or `null` for connection failures and unreadable
+responses) and `outcome`.
+
+Never logged: prompts, completions, request bodies, API keys, `Authorization` headers, and
+upstream error messages or response bodies. Upstream text can carry internal URLs,
+infrastructure details or fragments of the request, so the logs keep only the error type and
+status. A client still gets the sanitized message of a provider 400 (see "Model registry").
+
+### Limitations
+
+- A client that disconnects from a **non-streamed** request isn't detected: uvicorn discards
+  the response, and the request logs as `completed`. A disconnect during a stream's wait for the
+  provider is noticed when the stream starts (see Streaming).
+- During a shutdown, uvicorn waits for open requests to finish. A process killed before then
+  (for example by Docker's `SIGKILL` after its stop timeout) logs nothing more for them.
+  `cancelled` is only logged when uvicorn cancels them itself (`--timeout-graceful-shutdown`).
+- An unexpected exception is also logged by uvicorn, in its own format and without the request
+  IDs. The gateway's `http_request_finished` line has the same traceback, with the IDs.
+- uvicorn's access log is still written. For a stream it is written when the response starts,
+  so it always shows 200. `http_request_finished` and `inference_request_finished` show how the
+  request actually ended.
+- `app` log records also propagate to the root logger. uvicorn's default configuration gives
+  the root logger no handler, so nothing prints twice. With a custom `--log-config` that does,
+  exclude the `app` loggers there.
 
 ## Testing
 

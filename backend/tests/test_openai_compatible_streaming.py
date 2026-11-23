@@ -238,6 +238,7 @@ def test_invalid_usage_is_unreported_and_does_not_break_the_stream(usage, caplog
 
     assert chunks == [ACCEPTED, ChatChunk("ok"), ChatChunk("", "stop", None)]
     assert "invalid usage" in caplog.text
+    assert "invalid usage counts" not in caplog.text and "lots" not in caplog.text  # only the error type
 
 
 def test_invalid_groq_usage_is_unreported():

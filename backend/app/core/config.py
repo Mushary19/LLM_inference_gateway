@@ -62,9 +62,22 @@ class Settings(BaseSettings):
     rate_limit_requests_per_minute: int = Field(default=60, gt=0)  # sustained refill rate
     rate_limit_burst: int = Field(default=10, gt=0)  # bucket capacity
 
+    # Logging of the application's own loggers (see app/core/structured_logging.py). json: one
+    # JSON object per line; text: readable lines for local development.
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = "INFO"
+    log_format: Literal["json", "text"] = "json"
+
     # Token quota given to applications created without an explicit --token-limit.
     # A quota is a lifetime allowance: it never resets automatically.
     default_token_quota: int = Field(default=1_000_000, ge=0)
+
+    @field_validator("log_level", "log_format", mode="before")
+    @classmethod
+    def _case_insensitive(cls, value: object, info) -> object:
+        if not isinstance(value, str):
+            return value
+        value = value.strip()
+        return value.upper() if info.field_name == "log_level" else value.lower()
 
     @field_validator("model_registry_file", mode="before")
     @classmethod

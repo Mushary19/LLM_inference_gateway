@@ -329,7 +329,10 @@ def _stream_usage(raw: Any, model: str) -> Usage | None:
     try:
         return _parse_usage(raw)
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
-        logger.warning("Provider stream for %s reported invalid usage (%s); treating it as unreported", model, exc)
+        # Only the error type: the message would quote the upstream's values.
+        logger.warning(
+            "Provider stream for %s reported invalid usage (%s); treating it as unreported", model, type(exc).__name__
+        )
         return None
 
 

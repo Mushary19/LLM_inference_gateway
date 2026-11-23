@@ -4,18 +4,25 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from starlette.types import ASGIApp
 
 from app.api import chat, usage  # noqa: F401  (register their routes on the /v1 router)
 from app.api.health import router as health_router
+from app.api.middleware import RequestContextMiddleware
 from app.api.routes import router
 from app.api.v1 import router as v1_router
 from app.core.config import settings
+from app.core.structured_logging import configure_logging
 from app.database.connection import SessionLocal
 from app.providers.registry import registry_from_settings
 from app.services.inference import InferenceEngine, SimulatedInferenceEngine
 from app.services.rate_limit import TokenBucketRateLimiter, create_redis_client
 from app.services.resources import GpuMemoryManager, KvCacheSizer
 from app.services.scheduler import Scheduler
+
+# At import, so after uvicorn has applied its own logging configuration (it does that before
+# importing the app) and before anything below logs.
+configure_logging(settings.log_level, settings.log_format)
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +102,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         await model_registry.aclose()  # closes every provider; logs, never raises, on failure
 
 
-app = FastAPI(title="InferenceFlow", lifespan=lifespan)
+class InferenceFlowApp(FastAPI):
+    """FastAPI with RequestContextMiddleware around its entire middleware stack.
+
+    app.add_middleware() would place it inside ServerErrorMiddleware, which sends the 500
+    for an unhandled exception straight to the server, so that response would lack
+    X-Request-ID. Outermost, every response, that 500 included, passes through it.
+    """
+
+    def build_middleware_stack(self) -> ASGIApp:
+        return RequestContextMiddleware(super().build_middleware_stack())
+
+
+app = InferenceFlowApp(title="InferenceFlow", lifespan=lifespan)
 app.include_router(health_router)
 app.include_router(router)
 app.include_router(v1_router)
